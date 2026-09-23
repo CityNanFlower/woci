@@ -17,7 +17,7 @@ class LlmPreset {
       this.models, this.note);
 }
 
-/// 预设供应商（均为 OpenAI 兼容接口），模型清单来源：鲸鱼-API-Key管理表.xlsx
+/// 预设供应商（均为 OpenAI 兼容接口）
 const kLlmPresets = [
   LlmPreset('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1',
       'deepseek-flash', ['deepseek-flash', 'deepseek-v4-pro'],

@@ -1,5 +1,7 @@
-/// 本地数据层：生词表 + 复习记录 + 艾宾浩斯调度
+/// 本地数据层：生词表 + 复习记录 + 艾宾浩斯调度 + 自定义词书 + 统计
 library;
+
+import 'dart:convert';
 
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
@@ -19,6 +21,7 @@ class WordEntry {
   final String senseGroup; // 词义群（同义词串）
   final String senseNote; // 一句话辨析
   final String example; // 英文例句
+  final String source; // 来源：真题/听力/阅读/写作/翻译，空=未分类
 
   WordEntry({
     this.id,
@@ -35,6 +38,7 @@ class WordEntry {
     this.senseGroup = '',
     this.senseNote = '',
     this.example = '',
+    this.source = '',
   });
 
   Map<String, Object?> toMap() => {
@@ -52,6 +56,7 @@ class WordEntry {
         'sense_group': senseGroup,
         'sense_note': senseNote,
         'example': example,
+        'source': source,
       };
 
   static WordEntry fromMap(Map<String, Object?> m) => WordEntry(
@@ -69,6 +74,7 @@ class WordEntry {
         senseGroup: (m['sense_group'] ?? '') as String,
         senseNote: (m['sense_note'] ?? '') as String,
         example: (m['example'] ?? '') as String,
+        source: (m['source'] ?? '') as String,
       );
 }
 
@@ -78,6 +84,9 @@ class ReviewResult {
   static const fuzzy = 1;
   static const forgot = 0;
 }
+
+/// 来源预置项（选填，空 = 未分类）
+const kSourcePresets = ['真题', '听力', '阅读', '写作', '翻译'];
 
 class DB {
   static Database? _db;
@@ -92,7 +101,7 @@ class DB {
 
   static Future<Database> _open() async {
     final dir = await getDatabasesPath();
-    return openDatabase(p.join(dir, 'woci.db'), version: 2,
+    return openDatabase(p.join(dir, 'woci.db'), version: 3,
         onCreate: (db, v) async {
       await db.execute('''
         CREATE TABLE words(
@@ -109,7 +118,8 @@ class DB {
           topic TEXT DEFAULT '',
           sense_group TEXT DEFAULT '',
           sense_note TEXT DEFAULT '',
-          example TEXT DEFAULT ''
+          example TEXT DEFAULT '',
+          source TEXT DEFAULT ''
         )''');
       await db.execute('''
         CREATE TABLE reviews(
@@ -121,10 +131,11 @@ class DB {
       await db.execute('CREATE INDEX idx_due ON words(due_date)');
       await db.execute('CREATE INDEX idx_created ON words(created_at)');
       await db.execute('''
-        CREATE TABLE daily_lists(
-          date TEXT PRIMARY KEY,
-          content TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+        CREATE TABLE books(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          words_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
         )''');
     }, onUpgrade: (db, oldV, newV) async {
       if (oldV < 2) {
@@ -134,12 +145,35 @@ class DB {
         await db
             .execute("ALTER TABLE words ADD COLUMN sense_note TEXT DEFAULT ''");
         await db.execute("ALTER TABLE words ADD COLUMN example TEXT DEFAULT ''");
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_created ON words(created_at)');
+        await db
+            .execute('CREATE INDEX IF NOT EXISTS idx_created ON words(created_at)');
         await db.execute('''
           CREATE TABLE IF NOT EXISTS daily_lists(
             date TEXT PRIMARY KEY,
             content TEXT NOT NULL,
             updated_at TEXT NOT NULL
+          )''');
+      }
+      if (oldV < 3) {
+        await db.execute("ALTER TABLE words ADD COLUMN source TEXT DEFAULT ''");
+        // 旧 tags 里的来源预设迁移到 source
+        await db.execute(
+            "UPDATE words SET source = tags WHERE tags IN ('真题','听力','阅读','写作','翻译')");
+        // 旧私人话题 → 六级高频话题
+        await db.execute(
+            "UPDATE words SET topic = '科技创新' WHERE topic IN ('商业航天','低空经济')");
+        await db.execute(
+            "UPDATE words SET topic = '环境能源' WHERE topic = '环保气候'");
+        await db.execute(
+            "UPDATE words SET topic = '经济贸易' WHERE topic = '经济政策'");
+        await db.execute(
+            "UPDATE words SET topic = '教育学习' WHERE topic = '校园教育'");
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS books(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            words_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
           )''');
       }
     });
@@ -159,6 +193,16 @@ class DB {
         where: 'word = ?', whereArgs: [w.word.toLowerCase()]);
     if (dup.isNotEmpty) return null;
     return db.insert('words', w.toMap());
+  }
+
+  static Future<bool> wordExists(String word) async {
+    final db = await instance;
+    final rows = await db.query('words',
+        columns: ['id'],
+        where: 'word = ?',
+        whereArgs: [word.toLowerCase()],
+        limit: 1);
+    return rows.isNotEmpty;
   }
 
   static Future<List<WordEntry>> dueWords({int limit = 100}) async {
@@ -236,8 +280,8 @@ class DB {
     final db = await instance;
     final like = '%$q%';
     final rows = await db.query('words',
-        where: 'word LIKE ? OR translation LIKE ? OR tags LIKE ? OR note LIKE ?',
-        whereArgs: [like, like, like, like],
+        where: 'word LIKE ? OR translation LIKE ? OR tags LIKE ? OR note LIKE ? OR source LIKE ? OR topic LIKE ?',
+        whereArgs: [like, like, like, like, like, like],
         orderBy: 'id DESC',
         limit: 100);
     return rows.map(WordEntry.fromMap).toList();
@@ -245,7 +289,7 @@ class DB {
 
   static Future<List<WordEntry>> allWords() async {
     final db = await instance;
-    final rows = await db.query('words', orderBy: 'id DESC', limit: 500);
+    final rows = await db.query('words', orderBy: 'id DESC', limit: 5000);
     return rows.map(WordEntry.fromMap).toList();
   }
 
@@ -254,9 +298,9 @@ class DB {
     await db.update('words', {'note': note}, where: 'id = ?', whereArgs: [id]);
   }
 
-  static Future<void> updateTags(int id, String tags) async {
+  static Future<void> updateSource(int id, String source) async {
     final db = await instance;
-    await db.update('words', {'tags': tags}, where: 'id = ?', whereArgs: [id]);
+    await db.update('words', {'source': source}, where: 'id = ?', whereArgs: [id]);
   }
 
   static Future<void> deleteWord(int id) async {
@@ -265,11 +309,7 @@ class DB {
     await db.delete('reviews', where: 'word_id = ?', whereArgs: [id]);
   }
 
-  static Future<void> requeueOverdue() async {
-    // 保留逾期语义：dueWords 按 due_date <= today 查询即可，无需处理
-  }
-
-  // ---------------- 阶段2：聚类 / 词单 / LLM 增强 ----------------
+  // ---------------- 分类 / 增强 ----------------
 
   /// 某天新增的词
   static Future<List<WordEntry>> wordsCreatedOn(String date) async {
@@ -292,24 +332,48 @@ class DB {
     await db.update('words', m, where: 'id = ?', whereArgs: [id]);
   }
 
-  static Future<void> saveDailyList(String date, String contentJson) async {
+  // ---------------- 统计 ----------------
+
+  /// 每日复习次数（近 n 天），返回 {yyyy-MM-dd: count}，缺的天没有 key
+  static Future<Map<String, int>> reviewCountsByDay(int days) async {
     final db = await instance;
-    await db.insert(
-        'daily_lists',
-        {
-          'date': date,
-          'content': contentJson,
-          'updated_at': DateTime.now().toIso8601String(),
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace);
+    final from = _shift(today(), -(days - 1));
+    final rows = await db.rawQuery('''
+      SELECT substr(at, 1, 10) AS d, COUNT(*) AS c
+      FROM reviews WHERE at >= ? GROUP BY substr(at, 1, 10)
+    ''', ['$from T00:00'.replaceAll(' ', '')]);
+    return {for (final r in rows) r['d'] as String: (r['c'] as int?) ?? 0};
   }
 
-  /// 返回词单 JSON 字符串；无则 null
-  static Future<String?> loadDailyList(String date) async {
+  /// 每日新增生词（近 n 天）
+  static Future<Map<String, int>> createdCountsByDay(int days) async {
     final db = await instance;
-    final rows =
-        await db.query('daily_lists', where: 'date = ?', whereArgs: [date]);
-    if (rows.isEmpty) return null;
-    return rows.first['content'] as String?;
+    final from = _shift(today(), -(days - 1));
+    final rows = await db.rawQuery('''
+      SELECT created_at AS d, COUNT(*) AS c FROM words
+      WHERE created_at >= ? GROUP BY created_at
+    ''', [from]);
+    return {for (final r in rows) r['d'] as String: (r['c'] as int?) ?? 0};
+  }
+
+  // ---------------- 自定义词书 ----------------
+
+  static Future<int> addBook(String name, List<String> words) async {
+    final db = await instance;
+    return db.insert('books', {
+      'name': name,
+      'words_json': jsonEncode(words),
+      'created_at': today(),
+    });
+  }
+
+  static Future<List<Map<String, Object?>>> allBooks() async {
+    final db = await instance;
+    return db.query('books', orderBy: 'id DESC');
+  }
+
+  static Future<void> deleteBook(int id) async {
+    final db = await instance;
+    await db.delete('books', where: 'id = ?', whereArgs: [id]);
   }
 }

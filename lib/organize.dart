@@ -9,9 +9,11 @@ import 'dict.dart';
 import 'llm.dart';
 
 class Organize {
-  /// 预置话题组
+  /// 预置话题组：依据历年六级真题翻译/写作高频话题分类（传统文化≈40%、
+  /// 社会发展≈30%、科技≈20%、生态环保≈10% + 写作热点），不含私人方向。
   static const presetTopics = [
-    '环保气候', '商业航天', '低空经济', '经济政策', '校园教育',
+    '传统文化', '社会民生', '经济贸易', '科技创新', '环境能源',
+    '教育学习', '职场就业', '健康生活', '网络媒体', '生活日常',
   ];
 
   static const allTopicFallback = '生活日常';
@@ -35,11 +37,15 @@ class Organize {
   /// 离线规则：按中文释义关键词归话题（兜底）
   static String ruleTopic(String translation) {
     const rules = {
-      '环保气候': ['气候', '碳', '污染', '环保', '排放', '能源', '生态', '回收', '可再生', '全球变暖', '温室'],
-      '商业航天': ['航天', '卫星', '火箭', '轨道', '太空', '宇宙', '飞船', '发射', '宇航'],
-      '低空经济': ['无人机', '航空', '飞行', '直升机', '空域', '低空', '民航'],
-      '经济政策': ['经济', '贸易', '税收', '货币', '通胀', '财政', '投资', '市场', '金融', '补贴', '政策', '产业', '基金', '股', '债'],
-      '校园教育': ['学校', '课程', '学', '考试', '教', '论文', '学位', '校园', '成绩', '招生'],
+      '传统文化': ['文化', '节日', '传统', '习俗', '历史', '艺术', '书法', '京剧', '遗产', '民俗', '春节', '孔'],
+      '社会民生': ['社会', '民生', '城市', '乡村', '人口', '养老', '医疗', '住房', '法律', '政府', '公民', '福利', '脱贫'],
+      '经济贸易': ['经济', '贸易', '税收', '货币', '通胀', '财政', '投资', '市场', '金融', '补贴', '产业', '基金', '股', '债', '商品', '消费'],
+      '科技创新': ['科技', '技术', '数字', '智能', '算法', '数据', '机器', '电子', '设备', '卫星', '航天', '航空', '无人机', '创新', '工程', '网络', '通信'],
+      '环境能源': ['气候', '碳', '污染', '环保', '排放', '能源', '生态', '回收', '可再生', '全球变暖', '温室', '环境', '绿色'],
+      '教育学习': ['学校', '课程', '学', '考试', '教', '论文', '学位', '校园', '成绩', '招生', '知识', '读书'],
+      '职场就业': ['职业', '就业', '工作', '公司', '企业', '员工', '老板', '同事', '面试', '简历', '工资', '职场', '创业', '管理'],
+      '健康生活': ['健康', '疾病', '医', '药', '心理', '情绪', '压力', '运动', '饮食', '睡眠', '身体', '健身'],
+      '网络媒体': ['互联网', '网络', '媒体', '新闻', '广告', '社交', '视频', '直播', '流量', '平台', '隐私', '账号'],
     };
     for (final entry in rules.entries) {
       for (final kw in entry.value) {
@@ -69,9 +75,19 @@ class Organize {
       return 'empty';
     }
 
+    final usedLlm = await enrichWords(words);
+    await sp.setString('organized_date', today);
+    return usedLlm ? 'llm' : 'done';
+  }
+
+  /// 对给定词列表做规则打底 + LLM 增强（词书批量加入后也走这里）
+  /// 返回是否使用了 LLM
+  static Future<bool> enrichWords(List<WordEntry> words) async {
     // 1) 规则打底
     for (final w in words) {
-      final topic = w.topic.isEmpty ? ruleTopic(w.translation) : w.topic;
+      final topic = w.topic.isEmpty || presetTopicsOld.contains(w.topic)
+          ? ruleTopic(w.translation)
+          : w.topic;
       final group = w.senseGroup.isEmpty ? ruleSenseGroup(w.word) : w.senseGroup;
       if (topic != w.topic || group != w.senseGroup) {
         await DB.enrichWord(w.id!, topic: topic, senseGroup: group);
@@ -79,16 +95,14 @@ class Organize {
     }
 
     // 2) LLM 增强（未配置则跳过，结果仍可用）
-    var usedLlm = false;
     if (Llm.configured) {
-      usedLlm = await _llmEnrich(words);
+      return await _llmEnrich(words);
     }
-
-    // 3) 生成今日词单
-    await _buildDailyList(today);
-    await sp.setString('organized_date', today);
-    return usedLlm ? 'llm' : 'done';
+    return false;
   }
+
+  /// v1.1 的旧话题名（用于迁移重归类）
+  static const presetTopicsOld = ['环保气候', '商业航天', '低空经济', '经济政策', '校园教育'];
 
   /// LLM 批量增强：话题归属 + 词义群 + 一句话辨析 + 例句（含挖空版）
   static Future<bool> _llmEnrich(List<WordEntry> words) async {
@@ -132,28 +146,11 @@ class Organize {
             senseGroup: (e['group'] ?? '').toString(),
             senseNote: (e['note'] ?? '').toString(),
             example: (e['example'] ?? '').toString());
-        // cloze 单独存 prefs？不，cloze 可从 example 现场替换（例句含原形词）。
-        // 为保险起见存到 senseNote 之外的 example 字段即可，挖空在 UI 层做。
       }
       return true;
     } catch (_) {
       return false;
     }
-  }
-
-  /// 生成今日词单 JSON 存库
-  static Future<void> _buildDailyList(String date) async {
-    final words = await DB.wordsCreatedOn(date);
-    final list = words.map((w) => {
-          'w': w.word,
-          'p': w.phonetic,
-          't': w.translation,
-          'topic': w.topic,
-          'group': w.senseGroup,
-          'note': w.senseNote,
-          'example': w.example,
-        }).toList();
-    await DB.saveDailyList(date, json.encode(list));
   }
 
   /// 例句挖空：把目标词（含简单变形）替换为 _____；找不到返回 null

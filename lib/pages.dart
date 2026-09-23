@@ -1,12 +1,13 @@
-/// 设置页 + 今日词单页
+/// 设置页 + 今日词单页 + 统计页（打卡日历 / 图表）
 library;
 
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'db.dart';
+import 'csv_io.dart';
 import 'llm.dart';
-import 'main.dart' show kGreen, daysToExam;
+import 'main.dart' show kGreen, daysToExam, AppPrefs;
 import 'organize.dart';
+import 'wordlist_page.dart';
 
 // ---------------- 设置页 ----------------
 
@@ -26,6 +27,7 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _testOk = false;
   List<String> _topics = [];
   final _topicCtrl = TextEditingController();
+  late DateTime _examDate;
 
   @override
   void initState() {
@@ -35,6 +37,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _baseCtrl = TextEditingController(text: s.baseUrl);
     _modelCtrl = TextEditingController(text: s.model);
     _keyCtrl = TextEditingController(text: s.key);
+    _examDate = DateTime.parse(AppPrefs.examDate);
     _loadTopics();
   }
 
@@ -91,6 +94,50 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadTopics();
   }
 
+  Future<void> _saveExamDate() async {
+    AppPrefs.examDate =
+        '${_examDate.year.toString().padLeft(4, '0')}-${_examDate.month.toString().padLeft(2, '0')}-${_examDate.day.toString().padLeft(2, '0')}';
+    await AppPrefs.save();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _toggleMode(String mode, bool on) async {
+    var modes = [...AppPrefs.studyModes];
+    if (on) {
+      if (!modes.contains(mode)) modes.add(mode);
+    } else {
+      modes.remove(mode);
+    }
+    if (modes.isEmpty) modes = ['random'];
+    // 按固定顺序展示
+    modes.sort((a, b) =>
+        AppPrefs.modeOrder.indexOf(a).compareTo(AppPrefs.modeOrder.indexOf(b)));
+    AppPrefs.studyModes = modes;
+    await AppPrefs.save();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _exportCsv() async {
+    final n = await CsvIo.exportWords();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('已导出 $n 词，在分享面板选择保存位置')));
+  }
+
+  Future<void> _importCsv() async {
+    final r = await CsvIo.importWords();
+    if (!mounted) return;
+    final msg = switch (r) {
+      'no_file' => '已取消',
+      'bad_format' => '文件格式不对：需要含 word 列的 CSV（可先导出一份做模板）',
+      _ => () {
+          final n = int.tryParse(r.split(':').last) ?? 0;
+          return '导入完成：新增 $n 词（重复自动跳过）';
+        }(),
+    };
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -98,6 +145,79 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          // ---------- 学习偏好 ----------
+          const Text('学习偏好（复习测验模式）',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 4),
+          Text('可多选；多选时每个单词要完成所选模式的全部轮次才算复习过。'
+                  '全对=认识，错 1 轮=模糊，错 2 轮及以上=忘了。',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          const SizedBox(height: 12),
+          ...AppPrefs.modeOrder.map((m) => SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(AppPrefs.modeLabels[m]!,
+                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                subtitle: Text(AppPrefs.modeDescs[m]!,
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                value: AppPrefs.studyModes.contains(m),
+                onChanged: (v) => _toggleMode(m, v),
+              )),
+          const Divider(height: 32),
+
+          // ---------- 考试日期 ----------
+          const Text('考试日期', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 8),
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.event_outlined, color: kGreen),
+            title: Text(AppPrefs.examDate),
+            trailing: const Icon(Icons.edit_outlined, size: 18),
+            onTap: () async {
+              final picked = await showDatePicker(
+                context: context,
+                initialDate: _examDate,
+                firstDate: DateTime(2024),
+                lastDate: DateTime(2030),
+              );
+              if (picked != null) {
+                _examDate = picked;
+                await _saveExamDate();
+              }
+            },
+          ),
+          Text('距考试 ${daysToExam()} 天（开源默认值，按自己的考试改）',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          const Divider(height: 32),
+
+          // ---------- 数据 ----------
+          const Text('数据（CSV 导入导出）',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 4),
+          Text('导出含全部生词与复习进度；导入自动合并去重。每晚 22:00 也会在本机自动备份一份。',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _exportCsv,
+                icon: const Icon(Icons.ios_share),
+                label: const Text('导出 CSV'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _importCsv,
+                icon: const Icon(Icons.download),
+                label: const Text('导入 CSV'),
+              ),
+            ),
+          ]),
+          const Divider(height: 32),
+
+          // ---------- AI 增强 ----------
           const Text('AI 增强（可选）',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(height: 4),
@@ -134,8 +254,7 @@ class _SettingsPageState extends State<SettingsPage> {
             final cur = _modelCtrl.text.trim();
             return Column(children: [
               DropdownButtonFormField<String>(
-                initialValue:
-                    preset.models.contains(cur) ? cur : null,
+                initialValue: preset.models.contains(cur) ? cur : null,
                 decoration: const InputDecoration(
                   labelText: '模型（下拉选择）',
                   border: OutlineInputBorder(),
@@ -192,10 +311,12 @@ class _SettingsPageState extends State<SettingsPage> {
                       fontSize: 13, color: _testOk ? kGreen : Colors.red)),
             ),
           const Divider(height: 40),
+
+          // ---------- 话题组 ----------
           const Text('话题组',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(height: 4),
-          Text('新词自动归入话题组（AI 可用则智能归类，否则按关键词规则）。',
+          Text('预置话题来自六级真题高频分类；可再添加自定义话题（新词自动归类）。',
               style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           const SizedBox(height: 12),
           Wrap(
@@ -223,11 +344,13 @@ class _SettingsPageState extends State<SettingsPage> {
             FilledButton(onPressed: _addTopic, child: const Text('添加')),
           ]),
           const Divider(height: 40),
+
+          // ---------- 每日整理 ----------
           const Text('每日整理',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(height: 4),
           Text(
-              '每天 22:00 提醒整理；打开 App 时也会自动整理当天新词（词义群 + 话题双维聚类，生成今日词单）。',
+              '每天 22:00 提醒整理（后台任务也会自动整理并备份）；打开 App 时同样自动整理当天新词。',
               style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           const SizedBox(height: 12),
           OutlinedButton.icon(
@@ -245,7 +368,7 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 32),
           Center(
               child: Text(
-                  '蜗词 v1.1.0 · 距 2026-12-12 六级笔试 ${daysToExam()} 天',
+                  '蜗词 v1.2.0 · 开源版',
                   style: TextStyle(fontSize: 12, color: Colors.grey[500]))),
         ],
       ),
@@ -255,124 +378,323 @@ class _SettingsPageState extends State<SettingsPage> {
 
 // ---------------- 今日词单页 ----------------
 
-class DailyListPage extends StatefulWidget {
+class DailyListPage extends StatelessWidget {
   const DailyListPage({super.key});
   @override
-  State<DailyListPage> createState() => _DailyListPageState();
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(child: WordListPage(todayOnly: true)),
+    );
+  }
 }
 
-class _DailyListPageState extends State<DailyListPage> {
-  Map<String, List<Map<String, dynamic>>> _groups = {};
-  bool _loading = true;
+// ---------------- 统计页 ----------------
+
+class StatsPage extends StatefulWidget {
+  const StatsPage({super.key});
+  @override
+  StatsPageState createState() => StatsPageState();
+}
+
+class StatsPageState extends State<StatsPage> {
+  int _total = 0, _mastered = 0, _reviewedToday = 0;
+  Map<String, int> _reviewByDay = {};
+  Map<String, int> _createdByDay = {};
+  int _streak = 0;
+  int _range = 30; // 图表区间 7 / 30 天
+  DateTime _calMonth = DateTime(DateTime.now().year, DateTime.now().month);
 
   @override
   void initState() {
     super.initState();
-    _load();
+    refresh();
   }
 
-  Future<void> _load() async {
-    final raw = await DB.loadDailyList(DB.today());
-    final groups = <String, List<Map<String, dynamic>>>{};
-    if (raw != null) {
-      try {
-        final list = (json.decode(raw) as List)
-            .map((e) => Map<String, dynamic>.from(e as Map))
-            .toList();
-        for (final e in list) {
-          final topic = (e['topic'] ?? '').toString();
-          groups.putIfAbsent(topic.isEmpty ? '未分类' : topic, () => []).add(e);
-        }
-      } catch (_) {}
-    }
-    if (mounted) {
-      setState(() {
-        _groups = groups;
-        _loading = false;
-      });
-    }
+  Future<void> refresh() async {
+    _total = await DB.totalCount();
+    _mastered = await DB.masteredCount();
+    _reviewedToday = await DB.todayReviewedCount();
+    _reviewByDay = await DB.reviewCountsByDay(365);
+    _createdByDay = await DB.createdCountsByDay(365);
+    _streak = _calcStreak();
+    if (mounted) setState(() {});
   }
+
+  /// 连续打卡：从今天（或昨天）往前数，有复习记录即打卡
+  int _calcStreak() {
+    var streak = 0;
+    var day = DateTime.now();
+    if (!_reviewByDay.containsKey(_dayKey(day))) {
+      day = day.subtract(const Duration(days: 1));
+      if (!_reviewByDay.containsKey(_dayKey(day))) return 0;
+    }
+    while (_reviewByDay.containsKey(_dayKey(day))) {
+      streak++;
+      day = day.subtract(const Duration(days: 1));
+    }
+    return streak;
+  }
+
+  static String _dayKey(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('今日词单 · ${DB.today().substring(5)}')),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _groups.isEmpty
-              ? Center(
-                  child: Text('今天还没有整理出词单\n先去「今日」页录几个生词吧',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey[600])))
-              : ListView(
-                  padding: const EdgeInsets.all(16),
-                  children: _groups.entries.expand((g) => [
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8, bottom: 8),
-                          child: Text('【${g.key}】',
-                              style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.bold,
-                                  color: kGreen)),
-                        ),
-                        ...g.value.map(_wordCard),
-                      ]).toList(),
-                ),
+    return RefreshIndicator(
+      onRefresh: refresh,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 60, 16, 24),
+        children: [
+          const Text('统计', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: kGreen)),
+          const SizedBox(height: 16),
+          _statGrid(),
+          const SizedBox(height: 16),
+          _calendar(),
+          const SizedBox(height: 16),
+          _chartCard(),
+        ],
+      ),
     );
   }
 
-  Widget _wordCard(Map<String, dynamic> e) {
-    final word = (e['w'] ?? '') as String;
-    final phonetic = (e['p'] ?? '') as String;
-    final trans =
-        ((e['t'] ?? '') as String).split('；').first.split(';').first;
-    final group = (e['group'] ?? '') as String;
-    final note = (e['note'] ?? '') as String;
-    final example = (e['example'] ?? '') as String;
+  Widget _statGrid() {
+    return Row(children: [
+      Expanded(child: _statCard('累计生词', '$_total', Icons.library_books_outlined)),
+      const SizedBox(width: 10),
+      Expanded(child: _statCard('长期池', '$_mastered', Icons.verified_outlined)),
+    ]);
+  }
+
+  Widget _statCard(String label, String value, IconData icon) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: kGreen.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kGreen.withValues(alpha: 0.15)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(icon, color: kGreen, size: 20),
+          const SizedBox(width: 6),
+          Text(label, style: const TextStyle(fontSize: 13, color: Colors.black87)),
+        ]),
+        const SizedBox(height: 8),
+        Text(value,
+            style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.black)),
+      ]),
+    );
+  }
+
+  // ---------- 打卡日历 ----------
+
+  Widget _calendar() {
+    final first = DateTime(_calMonth.year, _calMonth.month, 1);
+    final daysInMonth = DateTime(_calMonth.year, _calMonth.month + 1, 0).day;
+    final lead = first.weekday % 7; // 周日=0
+    final today = DateTime.now();
+    final cells = <Widget>[];
+    for (var i = 0; i < lead; i++) {
+      cells.add(const SizedBox.shrink());
+    }
+    for (var d = 1; d <= daysInMonth; d++) {
+      final date = DateTime(_calMonth.year, _calMonth.month, d);
+      final key = _dayKey(date);
+      final count = _reviewByDay[key] ?? 0;
+      final isToday = _dayKey(today) == key;
+      final isFuture = date.isAfter(today);
+      cells.add(_calCell(d, count, isToday, isFuture));
+    }
     return Card(
-      margin: const EdgeInsets.only(bottom: 10),
       child: Padding(
         padding: const EdgeInsets.all(14),
-        child:
-            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
-            Text(word,
-                style:
-                    const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Text('打卡日历', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
             const SizedBox(width: 8),
-            Text(phonetic, style: TextStyle(fontSize: 13, color: Colors.grey[600])),
+            Chip(
+              label: Text('连续 $_streak 天',
+                  style: const TextStyle(fontSize: 12, color: kGreen, fontWeight: FontWeight.w600)),
+              backgroundColor: kGreen.withValues(alpha: 0.08),
+              visualDensity: VisualDensity.compact,
+            ),
+            const Spacer(),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.chevron_left),
+              onPressed: () => setState(() {
+                _calMonth = DateTime(_calMonth.year, _calMonth.month - 1);
+              }),
+            ),
+            Text('${_calMonth.year}.${_calMonth.month.toString().padLeft(2, '0')}',
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () => setState(() {
+                _calMonth = DateTime(_calMonth.year, _calMonth.month + 1);
+              }),
+            ),
           ]),
-          if (trans.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text(trans, style: const TextStyle(fontSize: 14)),
-            ),
-          if (group.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Text('词义群：$group',
-                style: const TextStyle(
-                    fontSize: 13,
-                    color: kGreen,
-                    fontWeight: FontWeight.w600)),
-          ],
-          if (note.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text('辨析：$note',
-                  style: const TextStyle(fontSize: 13, height: 1.4)),
-            ),
-          if (example.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(example,
-                  style: const TextStyle(
-                      fontSize: 13,
-                      height: 1.4,
-                      fontStyle: FontStyle.italic,
-                      color: Colors.black87)),
-            ),
+          const SizedBox(height: 4),
+          Row(children: ['日', '一', '二', '三', '四', '五', '六']
+              .map((w) => Expanded(
+                    child: Center(
+                        child: Text(w,
+                            style: TextStyle(fontSize: 11, color: Colors.grey[500]))),
+                  ))
+              .toList()),
+          const SizedBox(height: 4),
+          GridView.count(
+            crossAxisCount: 7,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            mainAxisSpacing: 4,
+            crossAxisSpacing: 4,
+            childAspectRatio: 1.1,
+            children: cells,
+          ),
+          const SizedBox(height: 4),
+          Text('有复习记录即打卡 · 当天复习了 $_reviewedToday 词',
+              style: TextStyle(fontSize: 11, color: Colors.grey[500])),
         ]),
       ),
     );
   }
+
+  Widget _calCell(int day, int count, bool isToday, bool isFuture) {
+    Color bg = Colors.transparent;
+    if (count > 0) {
+      bg = kGreen.withValues(alpha: (0.25 + (count.clamp(1, 10) / 10) * 0.55));
+    }
+    return Container(
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(8),
+        border: isToday ? Border.all(color: kGreen, width: 1.5) : null,
+      ),
+      child: Center(
+        child: Text(
+          '$day',
+          style: TextStyle(
+            fontSize: 12,
+            color: isFuture
+                ? Colors.grey[350]
+                : (count >= 5 ? Colors.white : Colors.black87),
+            fontWeight: count > 0 || isToday ? FontWeight.w600 : FontWeight.w400,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------- 图表 ----------
+
+  Widget _chartCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Text('复习趋势', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            const Spacer(),
+            SegmentedButton<int>(
+              segments: const [
+                ButtonSegment(value: 7, label: Text('7天')),
+                ButtonSegment(value: 30, label: Text('30天')),
+              ],
+              selected: {_range},
+              showSelectedIcon: false,
+              onSelectionChanged: (s) => setState(() => _range = s.first),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          SizedBox(height: 140, child: CustomPaint(
+            size: const Size(double.infinity, 140),
+            painter: _BarChartPainter(
+              reviewData: _series(_reviewByDay, _range),
+              createdData: _series(_createdByDay, _range),
+            ),
+          )),
+          const SizedBox(height: 8),
+          Row(children: [
+            _legend(kGreen, '每日复习次数'),
+            const SizedBox(width: 16),
+            _legend(Colors.amber.shade700, '每日新增生词'),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  Widget _legend(Color c, String label) => Row(children: [
+        Container(width: 10, height: 10, decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(2))),
+        const SizedBox(width: 4),
+        Text(label, style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+      ]);
+
+  List<double> _series(Map<String, int> data, int days) {
+    final out = <double>[];
+    final now = DateTime.now();
+    for (var i = days - 1; i >= 0; i--) {
+      final d = now.subtract(Duration(days: i));
+      out.add((data[_dayKey(d)] ?? 0).toDouble());
+    }
+    return out;
+  }
+}
+
+/// 简易双系列柱状图（复习=绿，新增=琥珀），全离线自绘
+class _BarChartPainter extends CustomPainter {
+  final List<double> reviewData;
+  final List<double> createdData;
+  _BarChartPainter({required this.reviewData, required this.createdData});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const green = Color(0xFF007A43);
+    const amber = Color(0xFFB57508);
+    final maxVal = [
+      ...reviewData.take(_lastN()),
+      ...createdData.take(_lastN()),
+    ].fold(1.0, (m, v) => v > m ? v : m);
+
+    final n = _lastN();
+    final chartH = size.height - 16;
+    final slot = size.width / n;
+    final barW = (slot - 1).clamp(1.0, n <= 7 ? 18.0 : 6.0);
+
+    // 基线
+    final baseY = chartH + 8;
+    canvas.drawLine(Offset(0, baseY), Offset(size.width, baseY),
+        Paint()..color = const Color(0x22000000)..strokeWidth = 1);
+
+    for (var i = 0; i < n; i++) {
+      final x = slot * i + slot / 2;
+      final rv = reviewData[i];
+      final cv = createdData[i];
+      if (rv > 0) {
+        final h = (rv / maxVal) * chartH;
+        canvas.drawRRect(
+            RRect.fromRectAndRadius(
+                Rect.fromLTWH(x - barW - 1, baseY - h, barW, h),
+                const Radius.circular(2)),
+            Paint()..color = green);
+      }
+      if (cv > 0) {
+        final h = (cv / maxVal) * chartH;
+        canvas.drawRRect(
+            RRect.fromRectAndRadius(
+                Rect.fromLTWH(x + 1, baseY - h, barW, h),
+                const Radius.circular(2)),
+            Paint()..color = amber);
+      }
+    }
+  }
+
+  int _lastN() => reviewData.length;
+
+  @override
+  bool shouldRepaint(covariant _BarChartPainter old) =>
+      old.reviewData != reviewData || old.createdData != createdData;
 }

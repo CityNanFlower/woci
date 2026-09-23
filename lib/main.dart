@@ -1,12 +1,21 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'bg.dart';
 import 'db.dart';
 import 'dict.dart';
 import 'llm.dart';
 import 'notify.dart';
 import 'organize.dart';
+import 'wordlist_page.dart';
+import 'wordbook.dart';
+import 'wordbook_page.dart';
 import 'pages.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.dark);
   runApp(const WoCiApp());
 }
 
@@ -30,8 +39,11 @@ class _WoCiAppState extends State<WoCiApp> {
     try {
       await DB.instance;
       await Dict.load();
+      await WordBooks.load();
       await Llm.load();
+      await AppPrefs.load();
       await Notify.init();
+      await registerBackgroundTask();
     } catch (e) {
       _error = e.toString();
     }
@@ -74,10 +86,45 @@ class _ErrorPage extends StatelessWidget {
 }
 
 const kGreen = Color(0xFF007A43);
-const kExamDate = '2026-12-12';
+
+/// 应用级偏好：考试日期 / 学习偏好（测验模式多选）
+class AppPrefs {
+  static String examDate = '2026-12-12';
+  static List<String> studyModes = ['random'];
+
+  static const modeOrder = ['random', 'sense', 'topic', 'spell'];
+  static const modeLabels = {
+    'random': '随机测验',
+    'sense': '词义群辨析',
+    'topic': '话题联想',
+    'spell': '拼写',
+  };
+  static const modeDescs = {
+    'random': '看词选义 / 看义选词，四选一',
+    'sense': '例句填空选词（无例句时选近义词）',
+    'topic': '按话题 + 释义提示联想选词',
+    'spell': '看释义手动输入拼写（全键盘）',
+  };
+
+  static Future<void> load() async {
+    final sp = await SharedPreferences.getInstance();
+    examDate = sp.getString('exam_date') ?? '2026-12-12';
+    final modes = sp.getStringList('study_modes');
+    studyModes = (modes == null || modes.isEmpty)
+        ? ['random']
+        : modes.where(modeOrder.contains).toList();
+    if (studyModes.isEmpty) studyModes = ['random'];
+  }
+
+  static Future<void> save() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString('exam_date', examDate);
+    await sp.setStringList('study_modes', studyModes);
+  }
+}
 
 int daysToExam() {
-  final exam = DateTime.parse(kExamDate);
+  final exam = DateTime.parse(AppPrefs.examDate);
   final now = DateTime.now();
   final today = DateTime(now.year, now.month, now.day);
   return exam.difference(today).inDays;
@@ -92,7 +139,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   int _tab = 0;
   final GlobalKey<TodayPageState> _todayKey = GlobalKey<TodayPageState>();
-  final GlobalKey<WordBookPageState> _bookKey = GlobalKey<WordBookPageState>();
+  final GlobalKey<WordListPageState> _wordListKey = GlobalKey<WordListPageState>();
   final GlobalKey<StatsPageState> _statsKey = GlobalKey<StatsPageState>();
 
   @override
@@ -102,15 +149,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 启动即触发当日整理（幂等：当天已整理自动跳过）
-  /// 规则聚类离线秒级完成；配置了 AI 则后台增强，完成后刷新
   Future<void> _autoOrganize() async {
     final r = await Organize.run();
     if (!mounted) return;
-    if (r == 'llm') {
-      _todayKey.currentState?.refresh();
-      _bookKey.currentState?.refresh();
-      _statsKey.currentState?.refresh();
-    }
+    if (r == 'llm') _refreshAll();
+  }
+
+  void _refreshAll() {
+    _todayKey.currentState?.refresh();
+    _wordListKey.currentState?.refresh();
+    _statsKey.currentState?.refresh();
   }
 
   @override
@@ -120,7 +168,8 @@ class _HomePageState extends State<HomePage> {
         index: _tab,
         children: [
           TodayPage(key: _todayKey),
-          WordBookPage(key: _bookKey),
+          const BookshelfPage(),
+          WordListPage(key: _wordListKey),
           StatsPage(key: _statsKey),
         ],
       ),
@@ -129,6 +178,7 @@ class _HomePageState extends State<HomePage> {
         onDestinationSelected: (i) => setState(() => _tab = i),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.today_outlined), selectedIcon: Icon(Icons.today), label: '今日'),
+          NavigationDestination(icon: Icon(Icons.auto_stories_outlined), selectedIcon: Icon(Icons.auto_stories), label: '词书'),
           NavigationDestination(icon: Icon(Icons.menu_book_outlined), selectedIcon: Icon(Icons.menu_book), label: '生词本'),
           NavigationDestination(icon: Icon(Icons.insights_outlined), selectedIcon: Icon(Icons.insights), label: '统计'),
         ],
@@ -143,9 +193,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _addWord() async {
     await showDialog(context: context, builder: (_) => const AddWordDialog());
-    _todayKey.currentState?.refresh();
-    _bookKey.currentState?.refresh();
-    _statsKey.currentState?.refresh();
+    _refreshAll();
   }
 }
 
@@ -186,6 +234,7 @@ class TodayPageState extends State<TodayPage> {
   @override
   Widget build(BuildContext context) {
     final days = daysToExam();
+    final modeCount = AppPrefs.studyModes.length;
     return RefreshIndicator(
       onRefresh: refresh,
       child: ListView(
@@ -197,7 +246,7 @@ class TodayPageState extends State<TodayPage> {
               const Spacer(),
               Chip(
                 avatar: const Icon(Icons.timer_outlined, size: 18, color: kGreen),
-                label: Text('距六级笔试 $days 天', style: const TextStyle(color: kGreen, fontWeight: FontWeight.w600)),
+                label: Text('距考试 $days 天', style: const TextStyle(color: kGreen, fontWeight: FontWeight.w600)),
                 backgroundColor: kGreen.withValues(alpha: 0.08),
               ),
               IconButton(
@@ -212,6 +261,7 @@ class TodayPageState extends State<TodayPage> {
             due: _due,
             reviewed: _reviewed,
             loading: _loading,
+            modeCount: modeCount,
             onStart: _due > 0 ? _startQuiz : null,
           ),
           const SizedBox(height: 16),
@@ -232,35 +282,12 @@ class TodayPageState extends State<TodayPage> {
           ),
           const SizedBox(height: 16),
           Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('快速录入', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
-                  const SizedBox(height: 4),
-                  Text('点右下角「录生词」按钮：输入单词自动补全释义，支持一次粘贴多个（空格/换行分隔）。',
-                      style: TextStyle(fontSize: 13, color: Colors.grey[700])),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('复习节奏', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
-                  const SizedBox(height: 8),
-                  Text('艾宾浩斯七轮：当天 → 1天 → 2天 → 4天 → 7天 → 15天 → 30天，之后进长期池每月抽查。',
-                      style: TextStyle(fontSize: 13, color: Colors.grey[700])),
-                  const SizedBox(height: 4),
-                  Text('认识=间隔升级 ｜ 模糊=明天再来 ｜ 忘了=回退重学',
-                      style: TextStyle(fontSize: 13, color: Colors.grey[700])),
-                ],
-              ),
+            child: ListTile(
+              leading: const Icon(Icons.style_outlined, color: kGreen),
+              title: const Text('学习偏好', style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text(AppPrefs.studyModes.map((m) => AppPrefs.modeLabels[m]).join(' + ')),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _openSettings,
             ),
           ),
         ],
@@ -277,6 +304,8 @@ class TodayPageState extends State<TodayPage> {
   Future<void> _openSettings() async {
     await Navigator.of(context)
         .push(MaterialPageRoute(builder: (_) => const SettingsPage()));
+    if (!mounted) return;
+    setState(() {}); // 学习偏好可能改了
     refresh();
   }
 }
@@ -285,11 +314,13 @@ class _DueCard extends StatelessWidget {
   final int due;
   final int reviewed;
   final bool loading;
+  final int modeCount;
   final VoidCallback? onStart;
-  const _DueCard({required this.due, required this.reviewed, required this.loading, this.onStart});
+  const _DueCard({required this.due, required this.reviewed, required this.loading, required this.modeCount, this.onStart});
 
   @override
   Widget build(BuildContext context) {
+    final rounds = modeCount > 1 ? '（每词 $modeCount 轮）' : '';
     return Card(
       color: kGreen,
       child: Padding(
@@ -301,7 +332,7 @@ class _DueCard extends StatelessWidget {
                 children: [
                   Text('$due',
                       style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Colors.white)),
-                  const Text('个词待复习', style: TextStyle(color: Colors.white70)),
+                  Text('个词待复习$rounds', style: const TextStyle(color: Colors.white70)),
                   const SizedBox(height: 8),
                   Text('今天已复习 $reviewed 个', style: const TextStyle(color: Colors.white70, fontSize: 13)),
                   const SizedBox(height: 16),
@@ -312,7 +343,7 @@ class _DueCard extends StatelessWidget {
                       foregroundColor: kGreen,
                       minimumSize: const Size(160, 44),
                     ),
-                    child: Text(due > 0 ? '开始辨析测验' : '今日已完成 ✓'),
+                    child: Text(due > 0 ? '开始复习测验' : '今日已完成 ✓'),
                   ),
                 ],
               ),
@@ -332,7 +363,7 @@ class AddWordDialog extends StatefulWidget {
 class _AddWordDialogState extends State<AddWordDialog> {
   final _controller = TextEditingController();
   DictItem? _found;
-  String _tags = '';
+  String _source = '';
   bool _bulk = false;
   String _msg = '';
 
@@ -355,7 +386,6 @@ class _AddWordDialogState extends State<AddWordDialog> {
   Future<void> _save() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
-    final tags = _tags;
     final today = DB.today();
     var added = 0;
     var dup = 0;
@@ -373,22 +403,29 @@ class _AddWordDialogState extends State<AddWordDialog> {
       items = [item];
     }
     for (final it in items) {
-      final r = await DB.addWord(WordEntry(
+      final id = await DB.addWord(WordEntry(
         word: it.word.toLowerCase(),
         phonetic: it.phonetic,
         translation: it.translation,
-        tags: tags,
+        source: _source,
         createdAt: today,
         dueDate: today,
       ));
-      if (r == null) { dup++; } else { added++; }
+      if (id == null) {
+        dup++;
+      } else {
+        added++;
+        // 立即规则打底（话题 + 词义群），AI 增强由每日整理完成
+        final t = Organize.ruleTopic(it.translation);
+        final g = Organize.ruleSenseGroup(it.word);
+        await DB.enrichWord(id, topic: t, senseGroup: g);
+      }
     }
     if (!mounted) return;
     setState(() {
       _msg = '已录入 $added 个${dup > 0 ? '，重复跳过 $dup 个' : ''}';
       _controller.clear();
       _found = null;
-      _tags = '';
     });
   }
 
@@ -435,19 +472,15 @@ class _AddWordDialogState extends State<AddWordDialog> {
             const SizedBox(height: 12),
             Wrap(
               spacing: 6,
-              children: ['真题', '听力', '写作', '翻译', '阅读']
-                  .map((t) => FilterChip(
-                        label: Text(t),
-                        selected: _tags.split(',').contains(t),
-                        onSelected: (sel) {
-                          setState(() {
-                            final list = _tags.split(',').where((s) => s.isNotEmpty).toList();
-                            if (sel) { if (!list.contains(t)) list.add(t); } else { list.remove(t); }
-                            _tags = list.join(',');
-                          });
-                        },
-                      ))
-                  .toList(),
+              children: [
+                const Text('来源（选填）：', style: TextStyle(fontSize: 13, color: Colors.grey)),
+                ...kSourcePresets.map((t) => FilterChip(
+                      label: Text(t),
+                      selected: _source == t,
+                      onSelected: (sel) =>
+                          setState(() => _source = sel ? t : ''),
+                    )),
+              ],
             ),
             if (_msg.isNotEmpty)
               Padding(
@@ -471,7 +504,7 @@ class _AddWordDialogState extends State<AddWordDialog> {
   }
 }
 
-// ---------------- 辨析测验 ----------------
+// ---------------- 复习测验（多模式 · 每词多轮） ----------------
 
 class QuizPage extends StatefulWidget {
   final VoidCallback? onDone;
@@ -480,23 +513,170 @@ class QuizPage extends StatefulWidget {
   State<QuizPage> createState() => _QuizPageState();
 }
 
+enum QuizMode { random, sense, topic, spell }
+
 class _QuizQuestion {
   final WordEntry entry;
-  final bool enToZh; // true: 看英文选中文；false: 看中文选英文
-  final bool isFill; // 例句填空题
-  final String cloze; // 挖空例句
+  final QuizMode mode;
+  final bool enToZh; // random 模式方向
+  final bool isCloze; // sense 模式：例句填空
+  final String cloze;
+  final bool isSynonym; // sense 模式：选近义词
   final List<String> options;
   final int answerIndex;
-  _QuizQuestion(this.entry, this.enToZh, this.options, this.answerIndex,
-      {this.isFill = false, this.cloze = ''});
+  _QuizQuestion({
+    required this.entry,
+    required this.mode,
+    this.enToZh = true,
+    this.isCloze = false,
+    this.cloze = '',
+    this.isSynonym = false,
+    this.options = const [],
+    this.answerIndex = 0,
+  });
+}
+
+/// 一次复习会话：按偏好模式给每个词生成多轮题目
+class _QuizSession {
+  final List<_QuizQuestion> questions = [];
+  /// 每题对应单词的序号（用于分组判分）
+  final List<int> wordIndexOf = [];
+  final List<WordEntry> words;
+  _QuizSession(this.words, List<QuizMode> modes) {
+    for (var wi = 0; wi < words.length; wi++) {
+      for (final m in modes) {
+        final q = _build(words[wi], m);
+        if (q != null) {
+          questions.add(q);
+          wordIndexOf.add(wi);
+        }
+      }
+    }
+  }
+
+  static QuizMode _fromKey(String key) => switch (key) {
+        'sense' => QuizMode.sense,
+        'topic' => QuizMode.topic,
+        'spell' => QuizMode.spell,
+        _ => QuizMode.random,
+      };
+
+  static Future<_QuizSession> build() async {
+    final due = await DB.dueWords(limit: 50);
+    final modes = AppPrefs.studyModes.map(_fromKey).toList();
+    return _QuizSession(due, modes);
+  }
+
+  _QuizQuestion? _build(WordEntry w, QuizMode mode) {
+    switch (mode) {
+      case QuizMode.random:
+        return _randomQ(w);
+      case QuizMode.sense:
+        return _senseQ(w);
+      case QuizMode.topic:
+        return _topicQ(w);
+      case QuizMode.spell:
+        return _spellQ(w);
+    }
+  }
+
+  _QuizQuestion _randomQ(WordEntry w) {
+    final enToZh = w.id!.isOdd;
+    final List<String> options = [];
+    if (enToZh) {
+      final correct = w.translation.isEmpty ? w.word : w.translation;
+      options.add(correct);
+      for (final d in Dict.distractors(w.word, 3)) {
+        final di = Dict.lookup(d);
+        final trans = di?.translation ?? d;
+        if (trans != correct && !options.contains(trans)) options.add(trans);
+        if (options.length >= 4) break;
+      }
+    } else {
+      options.add(w.word);
+      for (final d in Dict.distractors(w.word, 3)) {
+        if (!options.contains(d)) options.add(d);
+        if (options.length >= 4) break;
+      }
+    }
+    options.shuffle();
+    final correctText = enToZh ? (w.translation.isEmpty ? w.word : w.translation) : w.word;
+    return _QuizQuestion(
+        entry: w, mode: QuizMode.random, enToZh: enToZh,
+        options: options, answerIndex: options.indexOf(correctText));
+  }
+
+  _QuizQuestion? _senseQ(WordEntry w) {
+    final cloze = w.example.isNotEmpty ? Organize.makeCloze(w.example, w.word) : null;
+    if (cloze != null) {
+      final options = <String>[w.word];
+      for (final d in Dict.sameSenseWords(w.word, max: 12)) {
+        if (!options.contains(d)) options.add(d);
+        if (options.length >= 4) break;
+      }
+      for (final d in Dict.distractors(w.word, 4)) {
+        if (options.length >= 4) break;
+        if (!options.contains(d)) options.add(d);
+      }
+      options.shuffle();
+      return _QuizQuestion(entry: w, mode: QuizMode.sense, isCloze: true,
+          cloze: cloze, options: options, answerIndex: options.indexOf(w.word));
+    }
+    // 无例句：选近义词（词义群内）
+    final sibs = Dict.sameSenseWords(w.word, max: 8);
+    if (sibs.isEmpty) return _randomQ(w); // 降级
+    final correct = sibs.first;
+    final options = <String>[correct];
+    for (final d in Dict.distractors(w.word, 6)) {
+      if (!options.contains(d) && !sibs.contains(d)) options.add(d);
+      if (options.length >= 4) break;
+    }
+    options.shuffle();
+    return _QuizQuestion(entry: w, mode: QuizMode.sense, isSynonym: true,
+        options: options, answerIndex: options.indexOf(correct));
+  }
+
+  _QuizQuestion _topicQ(WordEntry w) {
+    // 干扰项：优先同话题的其它生词，不足用词典随机词
+    final options = <String>[w.word];
+    for (final d in _sameTopicWords(w)) {
+      if (!options.contains(d)) options.add(d);
+      if (options.length >= 4) break;
+    }
+    for (final d in Dict.distractors(w.word, 4)) {
+      if (options.length >= 4) break;
+      if (!options.contains(d)) options.add(d);
+    }
+    options.shuffle();
+    return _QuizQuestion(entry: w, mode: QuizMode.topic,
+        options: options, answerIndex: options.indexOf(w.word));
+  }
+
+  static List<WordEntry>? _topicPool;
+
+  List<String> _sameTopicWords(WordEntry w) {
+    _topicPool ??= <WordEntry>[]; // 延后填充（见 build 后 _fillTopicPool）
+    final pool = _topicPool!;
+    final rnd = Random(w.id!);
+    final cands = pool.where((e) => e.topic == w.topic && e.word != w.word).toList();
+    cands.shuffle(rnd);
+    return cands.take(3).map((e) => e.word).toList();
+  }
+
+  _QuizQuestion _spellQ(WordEntry w) {
+    return _QuizQuestion(entry: w, mode: QuizMode.spell);
+  }
 }
 
 class _QuizPageState extends State<QuizPage> {
-  List<_QuizQuestion> _questions = [];
+  _QuizSession? _session;
   int _index = 0;
   int? _picked;
   bool _answered = false;
+  bool _spellCorrect = false;
+  final _spellCtrl = TextEditingController();
   int _correct = 0;
+  final Map<int, int> _wrongByWord = {}; // wordIndex -> 错了几轮
   bool _loading = true;
 
   @override
@@ -505,141 +685,230 @@ class _QuizPageState extends State<QuizPage> {
     _build();
   }
 
+  @override
+  void dispose() {
+    _spellCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _build() async {
-    final due = await DB.dueWords(limit: 50);
-    final qs = <_QuizQuestion>[];
-    for (final w in due) {
-      // 优先例句填空（有例句时）：考"为什么用这个词而不用它的近义词"
-      final cloze = w.example.isNotEmpty ? Organize.makeCloze(w.example, w.word) : null;
-      if (cloze != null) {
-        final options = <String>[w.word];
-        for (final d in Dict.sameSenseWords(w.word, max: 12)) {
-          if (!options.contains(d)) options.add(d);
-          if (options.length >= 4) break;
-        }
-        for (final d in Dict.distractors(w.word, 4)) {
-          if (options.length >= 4) break;
-          if (!options.contains(d)) options.add(d);
-        }
-        options.shuffle();
-        qs.add(_QuizQuestion(w, false, options, options.indexOf(w.word),
-            isFill: true, cloze: cloze));
-        continue;
-      }
-      final enToZh = w.id!.isOdd; // 英中两个方向交替
-      final List<String> options = [];
-      if (enToZh) {
-        final correct = w.translation.isEmpty ? w.word : w.translation;
-        options.add(correct);
-        for (final d in Dict.distractors(w.word, 3)) {
-          final di = Dict.lookup(d);
-          final trans = di?.translation ?? d;
-          if (trans != correct && !options.contains(trans)) options.add(trans);
-          if (options.length >= 4) break;
-        }
-      } else {
-        options.add(w.word);
-        for (final d in Dict.distractors(w.word, 3)) {
-          if (!options.contains(d)) options.add(d);
-          if (options.length >= 4) break;
-        }
-      }
-      options.shuffle();
-      final correctText = enToZh ? (w.translation.isEmpty ? w.word : w.translation) : w.word;
-      qs.add(_QuizQuestion(w, enToZh, options, options.indexOf(correctText)));
-    }
+    final session = await _QuizSession.build();
+    // 同话题词池：给话题联想出干扰项
+    _QuizSession._topicPool = await DB.allWords();
     if (!mounted) return;
-    setState(() { _questions = qs; _loading = false; });
+    setState(() { _session = session; _loading = false; });
+  }
+
+  bool get _isWordLastRound {
+    final s = _session!;
+    final wi = s.wordIndexOf[_index];
+    return _index + 1 >= s.questions.length || s.wordIndexOf[_index + 1] != wi;
+  }
+
+  Future<void> _submitSpell() async {
+    if (_answered) return;
+    final q = _session!.questions[_index];
+    final input = _spellCtrl.text.trim().toLowerCase();
+    if (input.isEmpty) return;
+    setState(() {
+      _answered = true;
+      _spellCorrect = input == q.entry.word.toLowerCase();
+    });
+    await _record(_spellCorrect);
   }
 
   Future<void> _pick(int i) async {
     if (_answered) return;
-    final q = _questions[_index];
+    final q = _session!.questions[_index];
     setState(() { _picked = i; _answered = true; });
-    final result = i == q.answerIndex ? ReviewResult.known : ReviewResult.forgot;
-    if (i == q.answerIndex) _correct++;
-    await DB.review(q.entry.id!, result, q.entry.stage);
+    await _record(i == q.answerIndex);
   }
 
-  Future<void> _markFuzzy() async {
-    final q = _questions[_index];
-    await DB.review(q.entry.id!, ReviewResult.fuzzy, q.entry.stage);
-    _next();
+  Future<void> _record(bool correct) async {
+    if (correct) _correct++;
+    final s = _session!;
+    final wi = s.wordIndexOf[_index];
+    if (!correct) _wrongByWord[wi] = (_wrongByWord[wi] ?? 0) + 1;
+    // 该词的最后一轮：按总错轮数判分（全对=认识，错1轮=模糊，错≥2=忘了）
+    if (_isWordLastRound) {
+      final wrong = _wrongByWord[wi] ?? 0;
+      final result = wrong == 0
+          ? ReviewResult.known
+          : (wrong == 1 ? ReviewResult.fuzzy : ReviewResult.forgot);
+      await DB.review(s.words[wi].id!, result, s.words[wi].stage);
+    }
   }
 
   void _next() {
-    if (_index + 1 >= _questions.length) {
+    if (_index + 1 >= _session!.questions.length) {
       Navigator.pop(context);
       widget.onDone?.call();
       return;
     }
-    setState(() { _index++; _picked = null; _answered = false; });
+    setState(() {
+      _index++;
+      _picked = null;
+      _answered = false;
+      _spellCorrect = false;
+      _spellCtrl.clear();
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('辨析测验')),
+      appBar: AppBar(title: const Text('复习测验')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : _questions.isEmpty
+          : (_session == null || _session!.questions.isEmpty)
               ? const Center(child: Text('没有到期的词，明天再来吧'))
-              : (_answered && _picked != null && _picked != _questions[_index].answerIndex)
-                  ? _wrongView()
-                  : (_answered && _picked != null)
-                      ? _correctView()
-                      : _questionView(),
+              : _body(),
     );
   }
 
-  Widget _questionView() {
-    final q = _questions[_index];
-    final progress = (_index) / _questions.length;
+  Widget _body() {
+    final q = _session!.questions[_index];
+    if (_answered) {
+      final correct = q.mode == QuizMode.spell ? _spellCorrect : _picked == q.answerIndex;
+      return correct ? _correctView(q) : _wrongView(q);
+    }
+    return _questionView(q);
+  }
+
+  Widget _progressHeader() {
+    final s = _session!;
+    final wi = s.wordIndexOf[_index];
+    final wordNo = wi + 1;
+    final roundNo = s.wordIndexOf.take(_index + 1).where((x) => x == wi).length;
+    final totalRounds = s.wordIndexOf.where((x) => x == wi).length;
+    return Column(children: [
+      LinearProgressIndicator(
+          value: _index / s.questions.length, minHeight: 6,
+          borderRadius: BorderRadius.circular(3)),
+      const SizedBox(height: 8),
+      Text('词 $wordNo / ${s.words.length} · 第 $roundNo / $totalRounds 轮 · 已对 $_correct',
+          style: TextStyle(fontSize: 13, color: Colors.grey[600])),
+    ]);
+  }
+
+  Widget _questionView(_QuizQuestion q) {
+    final w = q.entry;
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
-        LinearProgressIndicator(value: progress, minHeight: 6, borderRadius: BorderRadius.circular(3)),
-        const SizedBox(height: 8),
-        Text('第 ${_index + 1} / ${_questions.length} 题 · 已对 $_correct',
-            style: TextStyle(fontSize: 13, color: Colors.grey[600])),
-        const SizedBox(height: 28),
-        if (q.isFill) ...[
-          Card(
-            color: kGreen.withValues(alpha: 0.05),
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(q.cloze,
-                  style: const TextStyle(fontSize: 17, height: 1.6)),
-            ),
-          ),
-          const SizedBox(height: 6),
-          Center(child: Text('结合句意，选出填空最恰当的词',
-              style: TextStyle(fontSize: 13, color: Colors.grey[600]))),
-          if (q.entry.translation.isNotEmpty)
-            Center(child: Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text('释义提示：${q.entry.translation.split('；').first.split(';').first}',
-                  style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-            )),
-        ] else ...[
-          Center(
-            child: q.enToZh
-                ? Text(q.entry.word,
-                    style: const TextStyle(fontSize: 40, fontWeight: FontWeight.bold))
-                : Text(q.entry.translation.isEmpty ? q.entry.word : q.entry.translation.split('；').first.split(';').first,
-                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600), textAlign: TextAlign.center),
-          ),
-          if (!q.enToZh && q.entry.phonetic.isNotEmpty)
-            Center(child: Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(q.entry.phonetic, style: TextStyle(fontSize: 14, color: Colors.grey[600])),
-            )),
-          const SizedBox(height: 6),
-          Center(child: Text(q.enToZh ? '选出正确释义' : '选出对应英文单词',
-              style: TextStyle(fontSize: 13, color: Colors.grey[600]))),
-        ],
-        const SizedBox(height: 28),
-        ...List.generate(q.options.length, (i) => _option(q, i)),
+        _progressHeader(),
+        const SizedBox(height: 24),
+        ...switch (q.mode) {
+          QuizMode.random => [
+              Center(
+                child: q.enToZh
+                    ? Text(w.word, style: const TextStyle(fontSize: 40, fontWeight: FontWeight.bold))
+                    : Text(w.translation.isEmpty ? w.word : w.translation.split('；').first.split(';').first,
+                        style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                        textAlign: TextAlign.center),
+              ),
+              if (!q.enToZh && w.phonetic.isNotEmpty)
+                Center(child: Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(w.phonetic, style: TextStyle(fontSize: 14, color: Colors.grey[600])),
+                )),
+              const SizedBox(height: 6),
+              Center(child: Text(q.enToZh ? '选出正确释义' : '选出对应英文单词',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[600]))),
+              const SizedBox(height: 24),
+              ...List.generate(q.options.length, (i) => _option(q, i)),
+            ],
+          QuizMode.sense when q.isCloze => [
+              Card(
+                color: kGreen.withValues(alpha: 0.05),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(q.cloze, style: const TextStyle(fontSize: 17, height: 1.6)),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Center(child: Text('结合句意，选出填空最恰当的词',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[600]))),
+              if (w.translation.isNotEmpty)
+                Center(child: Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text('释义提示：${w.translation.split('；').first.split(';').first}',
+                      style: TextStyle(fontSize: 12, color: Colors.grey[500])),
+                )),
+              const SizedBox(height: 24),
+              ...List.generate(q.options.length, (i) => _option(q, i)),
+            ],
+          QuizMode.sense => [
+              Center(child: Text(w.word,
+                  style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold))),
+              if (w.translation.isNotEmpty)
+                Center(child: Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text('释义：${w.translation.split('；').first.split(';').first}',
+                      style: TextStyle(fontSize: 13, color: Colors.grey[600])),
+                )),
+              const SizedBox(height: 6),
+              const Center(child: Text('选出与它词义最接近的词',
+                  style: TextStyle(fontSize: 13, color: Colors.grey))),
+              const SizedBox(height: 24),
+              ...List.generate(q.options.length, (i) => _option(q, i)),
+            ],
+          QuizMode.topic => [
+              Center(child: Text(w.topic.isEmpty ? '生活日常' : w.topic,
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: kGreen))),
+              const SizedBox(height: 10),
+              Center(child: Text(w.translation.isEmpty ? '(无释义)' : w.translation.split('；').first.split(';').first,
+                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                  textAlign: TextAlign.center)),
+              const SizedBox(height: 6),
+              const Center(child: Text('按话题与释义，联想对应英文单词',
+                  style: TextStyle(fontSize: 13, color: Colors.grey))),
+              const SizedBox(height: 24),
+              ...List.generate(q.options.length, (i) => _option(q, i)),
+            ],
+          QuizMode.spell => [
+              Card(
+                color: kGreen.withValues(alpha: 0.05),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('释义：${w.translation.isEmpty ? '(无释义)' : w.translation}',
+                        style: const TextStyle(fontSize: 15, height: 1.5)),
+                    if (w.phonetic.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text('音标：${w.phonetic}',
+                            style: TextStyle(fontSize: 14, color: Colors.grey[600])),
+                      ),
+                  ]),
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Center(child: Text('手动输入单词拼写', style: TextStyle(fontSize: 13, color: Colors.grey))),
+              const SizedBox(height: 20),
+              TextField(
+                controller: _spellCtrl,
+                autofocus: true,
+                inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\-]'))],
+                decoration: InputDecoration(
+                  hintText: '输入英文单词',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                      icon: const Icon(Icons.send_outlined, color: kGreen),
+                      onPressed: _submitSpell),
+                ),
+                onSubmitted: (_) => _submitSpell(),
+              ),
+              const SizedBox(height: 12),
+              Center(child: TextButton(
+                onPressed: () async {
+                  setState(() { _answered = true; _spellCorrect = false; });
+                  await _record(false);
+                },
+                child: const Text('想不起来 · 判错'),
+              )),
+            ],
+        },
       ],
     );
   }
@@ -674,8 +943,7 @@ class _QuizPageState extends State<QuizPage> {
   }
 
   /// 辨析解析卡：完整例句 + 同义词群 + 一句话辨析
-  Widget _analysisCard(_QuizQuestion q) {
-    final w = q.entry;
+  Widget _analysisCard(WordEntry w) {
     return Card(
       color: kGreen.withValues(alpha: 0.04),
       child: Padding(
@@ -701,8 +969,7 @@ class _QuizPageState extends State<QuizPage> {
     );
   }
 
-  Widget _correctView() {
-    final q = _questions[_index];
+  Widget _correctView(_QuizQuestion q) {
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
@@ -711,225 +978,38 @@ class _QuizPageState extends State<QuizPage> {
         const Center(child: Text('答对了',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: kGreen))),
         const SizedBox(height: 16),
-        _analysisCard(q),
+        _analysisCard(q.entry),
         const SizedBox(height: 24),
         FilledButton(
           onPressed: _next,
           style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
-          child: Text(_index + 1 >= _questions.length ? '完成测验' : '下一题'),
+          child: Text(_index + 1 >= _session!.questions.length ? '完成测验' : '下一题'),
         ),
       ],
     );
   }
 
-  Widget _wrongView() {
-    final q = _questions[_index];
-    final correct = q.options[q.answerIndex];
-    final correctItem = Dict.lookup(q.enToZh ? correct : q.entry.word);
+  Widget _wrongView(_QuizQuestion q) {
+    final w = q.entry;
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
         const Icon(Icons.close, color: Colors.red, size: 48),
         const SizedBox(height: 8),
-        Center(child: Text('正确答案：${q.enToZh ? q.entry.word : correct}',
+        Center(child: Text('正确答案：${w.word}',
             style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))),
         const SizedBox(height: 4),
-        Center(child: Text(q.enToZh ? correct : (correctItem?.translation ?? ''),
+        Center(child: Text(w.translation.isEmpty ? '' : w.translation.split('；').first.split(';').first,
             style: const TextStyle(fontSize: 15, color: kGreen, fontWeight: FontWeight.w600))),
         const SizedBox(height: 16),
-        _analysisCard(q),
+        _analysisCard(w),
         const SizedBox(height: 24),
         FilledButton(
-          onPressed: _markFuzzy,
-          style: FilledButton.styleFrom(backgroundColor: Colors.amber.shade700, minimumSize: const Size.fromHeight(48)),
-          child: const Text('记混了 · 明天再来（模糊）'),
-        ),
-        const SizedBox(height: 10),
-        OutlinedButton(
           onPressed: _next,
-          style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
-          child: const Text('完全忘了 · 回退重学'),
+          style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+          child: Text(_index + 1 >= _session!.questions.length ? '完成测验' : '下一题'),
         ),
       ],
-    );
-  }
-}
-
-// ---------------- 生词本 ----------------
-
-class WordBookPage extends StatefulWidget {
-  const WordBookPage({super.key});
-  @override
-  WordBookPageState createState() => WordBookPageState();
-}
-
-class WordBookPageState extends State<WordBookPage> {
-  List<WordEntry> _words = [];
-  String _query = '';
-
-  @override
-  void initState() {
-    super.initState();
-    refresh();
-  }
-
-  Future<void> refresh() async {
-    final words = _query.isEmpty ? await DB.allWords() : await DB.search(_query);
-    if (mounted) setState(() => _words = words);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 56, 16, 8),
-          child: TextField(
-            decoration: InputDecoration(
-              hintText: '全局搜索：单词 / 释义 / 标签 / 笔记',
-              prefixIcon: const Icon(Icons.search),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              isDense: true,
-            ),
-            onChanged: (v) { _query = v; refresh(); },
-          ),
-        ),
-        Expanded(
-          child: _words.isEmpty
-              ? Center(child: Text(_query.isEmpty ? '还没有生词，去「今日」页录入吧' : '没有匹配结果', style: TextStyle(color: Colors.grey[600])))
-              : ListView.builder(
-                  padding: const EdgeInsets.only(bottom: 24),
-                  itemCount: _words.length,
-                  itemBuilder: (_, i) => _tile(_words[i]),
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _tile(WordEntry w) {
-    final stageLabel = w.stage >= 7 ? '长期池' : '第${w.stage + 1}轮';
-    return ListTile(
-      title: Text('${w.word}  ${w.phonetic}', style: const TextStyle(fontWeight: FontWeight.w600)),
-      subtitle: Text(
-        '${w.translation.split('；').first.split(';').first}${w.tags.isEmpty ? '' : ' · ${w.tags}'}\n$stageLabel · 到期 ${w.dueDate}${w.lapses > 0 ? ' · 忘过${w.lapses}次' : ''}',
-        maxLines: 2, overflow: TextOverflow.ellipsis,
-      ),
-      isThreeLine: true,
-      trailing: w.stage >= 7
-          ? const Icon(Icons.verified, color: kGreen)
-          : Icon(Icons.school_outlined, color: Colors.grey[400]),
-      onTap: () => _showDetail(w),
-    );
-  }
-
-  Future<void> _showDetail(WordEntry w) async {
-    final noteCtrl = TextEditingController(text: w.note);
-    await showDialog(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: Text('${w.word}  ${w.phonetic}'),
-        content: SizedBox(
-          width: 380,
-          child: SingleChildScrollView(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-              Text(w.translation, style: const TextStyle(fontSize: 14)),
-              const SizedBox(height: 8),
-              Text('录入：${w.createdAt} ｜ 阶段：${w.stage >= 7 ? '长期池' : '第${w.stage + 1}轮'} ｜ 到期：${w.dueDate}',
-                  style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-              const SizedBox(height: 12),
-              TextField(
-                controller: noteCtrl,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  labelText: '我的笔记 / 助记',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ]),
-          ),
-        ),
-        actions: [
-          TextButton.icon(
-            onPressed: () async {
-              await DB.deleteWord(w.id!);
-              if (dialogCtx.mounted) Navigator.pop(dialogCtx);
-              refresh();
-            },
-            label: const Text('删除', style: TextStyle(color: Colors.red)),
-            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 18),
-          ),
-          FilledButton(
-            onPressed: () async {
-              await DB.updateNote(w.id!, noteCtrl.text);
-              if (dialogCtx.mounted) Navigator.pop(dialogCtx);
-              refresh();
-            },
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------------- 统计 ----------------
-
-class StatsPage extends StatefulWidget {
-  const StatsPage({super.key});
-  @override
-  StatsPageState createState() => StatsPageState();
-}
-
-class StatsPageState extends State<StatsPage> {
-  int _total = 0, _mastered = 0, _due = 0, _reviewedToday = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    refresh();
-  }
-
-  Future<void> refresh() async {
-    _total = await DB.totalCount();
-    _mastered = await DB.masteredCount();
-    _due = await DB.dueCount();
-    _reviewedToday = await DB.todayReviewedCount();
-    if (mounted) setState(() {});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return GridView.count(
-      padding: const EdgeInsets.fromLTRB(16, 60, 16, 24),
-      crossAxisCount: 2,
-      mainAxisSpacing: 12,
-      crossAxisSpacing: 12,
-      childAspectRatio: 1.6,
-      children: [
-        _statCard('累计生词', '$_total', Icons.library_books_outlined),
-        _statCard('已入长期池', '$_mastered', Icons.verified_outlined),
-        _statCard('今日待复习', '$_due', Icons.schedule_outlined),
-        _statCard('今日已复习', '$_reviewedToday', Icons.task_alt_outlined),
-      ],
-    );
-  }
-
-  Widget _statCard(String label, String value, IconData icon) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: kGreen, size: 28),
-            const SizedBox(height: 8),
-            Text(value, style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold)),
-            Text(label, style: TextStyle(fontSize: 13, color: Colors.grey[600])),
-          ],
-        ),
-      ),
     );
   }
 }

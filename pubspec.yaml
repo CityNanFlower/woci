@@ -1,7 +1,7 @@
 name: wo_ci
-description: "蜗词 - 六级冲刺生词本"
+description: "蜗词 - 六级冲刺生词本（开源版）"
 publish_to: 'none'
-version: 1.1.1+3
+version: 1.2.0+4
 
 environment:
   sdk: ^3.13.4
@@ -16,13 +16,26 @@ dependencies:
   flutter_local_notifications: ^19.0.0
   timezone: ^0.10.0
   http: ^1.2.0
+  workmanager: ^0.10.0
+  file_picker: ^8.1.0
+  share_plus: ^11.0.0
+  path_provider: ^2.1.0
+  csv: ^6.0.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.1
+
+flutter_launcher_icons:
+  image_path: "assets/icon/logo.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon/logo_fg.png"
+  android: true
 
 flutter:
   uses-material-design: true
   assets:
-    - assets/dict_cet6.json
+    - assets/dict.json
+    - assets/wordbooks/

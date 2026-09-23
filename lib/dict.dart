@@ -25,7 +25,7 @@ class Dict {
 
   static Future<void> load() async {
     try {
-      final raw = await rootBundle.loadString('assets/dict_cet6.json');
+      final raw = await rootBundle.loadString('assets/dict.json');
       final List data = json.decode(raw) as List;
       for (final e in data) {
         final item = DictItem(
