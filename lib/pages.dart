@@ -128,10 +128,31 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 12),
+          Builder(builder: (context) {
+            final preset = kLlmPresets.firstWhere((p) => p.id == _presetId);
+            if (preset.models.isEmpty) return const SizedBox.shrink();
+            final cur = _modelCtrl.text.trim();
+            return Column(children: [
+              DropdownButtonFormField<String>(
+                initialValue:
+                    preset.models.contains(cur) ? cur : null,
+                decoration: const InputDecoration(
+                  labelText: '模型（下拉选择）',
+                  border: OutlineInputBorder(),
+                ),
+                hint: const Text('选择模型'),
+                items: preset.models
+                    .map((m) => DropdownMenuItem(value: m, child: Text(m)))
+                    .toList(),
+                onChanged: (v) => setState(() => _modelCtrl.text = v!),
+              ),
+              const SizedBox(height: 12),
+            ]);
+          }),
           TextField(
             controller: _modelCtrl,
             decoration: const InputDecoration(
-              labelText: '模型名',
+              labelText: '模型名（可手动输入任意型号）',
               border: OutlineInputBorder(),
             ),
           ),
