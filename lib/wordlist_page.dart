@@ -4,6 +4,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'db.dart';
+import 'dict.dart';
 import 'main.dart' show kGreen;
 
 /// 分类轴
@@ -229,7 +230,7 @@ class WordListPageState extends State<WordListPage> {
       dense: true,
       title: Text('${w.word}  ${w.phonetic}', style: const TextStyle(fontWeight: FontWeight.w600)),
       subtitle: Text(
-        '${w.translation.split('；').first.split(';').first}'
+        '${Dict.firstSense(w.translation)}'
         '${w.topic.isEmpty ? '' : ' · ${w.topic}'}'
         '${w.source.isEmpty ? '' : ' · ${w.source}'}'
         '\n$stageLabel · 到期 ${w.dueDate}${w.lapses > 0 ? ' · 忘过${w.lapses}次' : ''}',

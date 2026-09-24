@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 可对外授权（给系统安装器读取）的目录白名单 -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 主用：/storage/emulated/0/Android/data/com.shanqiu.wo_ci/files/updates -->
+    <external-files-path
+        name="updates_external"
+        path="updates/" />
+    <!-- 兜底 1：应用内部 files/updates -->
+    <files-path
+        name="updates_internal"
+        path="updates/" />
+    <!-- 兜底 2：应用 cache/updates -->
+    <cache-path
+        name="updates_cache"
+        path="updates/" />
+</paths>

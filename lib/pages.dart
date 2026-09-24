@@ -1,12 +1,15 @@
 /// 设置页 + 今日词单页 + 统计页（打卡日历 / 图表）
 library;
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'db.dart';
 import 'csv_io.dart';
 import 'llm.dart';
 import 'main.dart' show kGreen, daysToExam, AppPrefs;
 import 'organize.dart';
+import 'update.dart';
 import 'wordlist_page.dart';
 
 // ---------------- 设置页 ----------------
@@ -28,6 +31,10 @@ class _SettingsPageState extends State<SettingsPage> {
   List<String> _topics = [];
   final _topicCtrl = TextEditingController();
   late DateTime _examDate;
+  late TextEditingController _updateCtrl;
+  bool _checkingUpdate = false;
+  String _updateMsg = '';
+  bool _updateOk = false;
 
   @override
   void initState() {
@@ -38,6 +45,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _modelCtrl = TextEditingController(text: s.model);
     _keyCtrl = TextEditingController(text: s.key);
     _examDate = DateTime.parse(AppPrefs.examDate);
+    _updateCtrl = TextEditingController(text: Updater.sourceUrl);
     _loadTopics();
   }
 
@@ -47,6 +55,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _modelCtrl.dispose();
     _keyCtrl.dispose();
     _topicCtrl.dispose();
+    _updateCtrl.dispose();
     super.dispose();
   }
 
@@ -118,24 +127,105 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _exportCsv() async {
-    final n = await CsvIo.exportWords();
+    final r = await CsvIo.exportWords();
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('已导出 $n 词，在分享面板选择保存位置')));
+    final extra = r.reviews > 0 ? ' + ${r.reviews} 条复习记录' : '';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('已导出 ${r.words} 词$extra，在分享面板选择保存位置')));
   }
 
   Future<void> _importCsv() async {
     final r = await CsvIo.importWords();
     if (!mounted) return;
-    final msg = switch (r) {
-      'no_file' => '已取消',
-      'bad_format' => '文件格式不对：需要含 word 列的 CSV（可先导出一份做模板）',
-      _ => () {
-          final n = int.tryParse(r.split(':').last) ?? 0;
-          return '导入完成：新增 $n 词（重复自动跳过）';
-        }(),
-    };
+    final msg = !r.ok
+        ? (r.error == 'no_file'
+            ? '已取消'
+            : '文件格式不对：需要含 word 列的 CSV（可先导出一份做模板）')
+        : '导入完成：新增 ${r.words} 词，恢复 ${r.reviews} 条复习记录（重复自动跳过）';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  // ---------- 软件更新 ----------
+
+  Future<void> _saveUpdateSource() async {
+    await Updater.saveSourceUrl(_updateCtrl.text);
+    if (!mounted) return;
+    setState(() {
+      _updateOk = true;
+      _updateMsg = Updater.configured
+          ? '已保存：${Updater.resolveManifestUrl(Updater.sourceUrl)}'
+          : '更新源已清空';
+    });
+  }
+
+  Future<void> _checkUpdate() async {
+    if (!Updater.configured && _updateCtrl.text.trim().isEmpty) {
+      setState(() {
+        _updateMsg = '请先填写更新源地址并保存';
+        _updateOk = false;
+      });
+      return;
+    }
+    await Updater.saveSourceUrl(_updateCtrl.text);
+    setState(() {
+      _checkingUpdate = true;
+      _updateMsg = '';
+    });
+    final r = await Updater.check(manual: true);
+    if (!mounted) return;
+    setState(() {
+      _checkingUpdate = false;
+      switch (r.status) {
+        case UpdateStatus.upToDate:
+          _updateOk = true;
+          _updateMsg = '已是最新版本 v$kAppVersionName';
+          break;
+        case UpdateStatus.hasUpdate:
+          _updateOk = true;
+          _updateMsg = '发现新版本 v${r.info!.versionName}';
+          break;
+        case UpdateStatus.notConfigured:
+          _updateOk = false;
+          _updateMsg = r.message.isEmpty ? '还没有配置更新源' : r.message;
+          break;
+        case UpdateStatus.error:
+          _updateOk = false;
+          _updateMsg = r.message;
+          break;
+      }
+    });
+    if (r.status == UpdateStatus.hasUpdate) {
+      await _showUpdateDialog(r.info!);
+    }
+  }
+
+  Future<void> _showUpdateDialog(UpdateInfo info) async {
+    final action = await showUpdatePrompt(context, info);
+    if (!mounted) return;
+    if (action == 'update') {
+      await showUpdateDownload(context, info);
+    } else if (action == 'skip') {
+      setState(() {
+        _updateOk = true;
+        _updateMsg = '已跳过 v${info.versionName}（手动检查时仍会提示）';
+      });
+    }
+  }
+
+  Future<void> _installLocalApk() async {
+    final files = await Updater.downloadedApks();
+    if (!mounted) return;
+    if (files.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('还没有下载过安装包')));
+      return;
+    }
+    final pick = await pickLocalApk(context, files);
+    if (pick == null || !mounted) return;
+    final r = await Updater.install(pick);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(installResultMessage(r))));
   }
 
   @override
@@ -350,28 +440,322 @@ class _SettingsPageState extends State<SettingsPage> {
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(height: 4),
           Text(
-              '每天 22:00 提醒整理（后台任务也会自动整理并备份）；打开 App 时同样自动整理当天新词。',
+              '每天 22:00 提醒整理（后台任务也会自动整理并备份）；打开 App 时同样自动整理当天新词。'
+              '配了 AI 后，每次运行最多增强 60 词，剩下的会在下次运行继续补，不会漏。',
               style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: () async {
               final r = await Organize.run(force: true);
               if (!mounted) return;
+              final left = r.pending > 0
+                  ? '，还剩 ${r.pending} 词待 AI 增强（下次启动继续补）'
+                  : '';
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                  content: Text(r == 'empty'
-                      ? '今天还没有新词'
-                      : '整理完成${r == 'llm' ? '（AI 增强）' : ''}')));
+                  content: Text(r.status == 'empty'
+                      ? '没有需要整理的词'
+                      : '整理完成${r.enriched > 0 ? '（AI 增强 ${r.enriched} 词）' : ''}$left')));
             },
             icon: const Icon(Icons.refresh),
-            label: const Text('立即整理今天的词'),
+            label: const Text('立即整理 / 补齐 AI 增强'),
+          ),
+          const Divider(height: 40),
+
+          // ---------- 软件更新 ----------
+          const Text('软件更新',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 4),
+          Text(
+              '下载新版本并在应用内安装。更新源填 version.json 的直链，'
+              '或只填它所在的目录（会自动补 /version.json）；建议用 https。',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _updateCtrl,
+                decoration: const InputDecoration(
+                  labelText: '更新源地址',
+                  hintText: 'https://…/version.json',
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            OutlinedButton(
+                onPressed: _saveUpdateSource, child: const Text('保存')),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _checkingUpdate ? null : _checkUpdate,
+                icon: _checkingUpdate
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.system_update_alt),
+                label: const Text('检查更新'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _installLocalApk,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('装已下载包'),
+              ),
+            ),
+          ]),
+          if (_updateMsg.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_updateMsg,
+                  style: TextStyle(
+                      fontSize: 13, color: _updateOk ? kGreen : Colors.red)),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+                '当前 v$kAppVersionName（构建号 $kAppVersionCode）'
+                '${Updater.lastCheck == null ? '' : '　上次检查 ${_fmtTime(Updater.lastCheck!)}'}',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           ),
           const SizedBox(height: 32),
           Center(
               child: Text(
-                  '蜗词 v1.2.0 · 开源版',
+                  '蜗词 v$kAppVersionName · 开源版',
                   style: TextStyle(fontSize: 12, color: Colors.grey[500]))),
         ],
       ),
+    );
+  }
+}
+
+/// 弹出「发现新版本」提示框；返回 'update' / 'skip' / 'later' / null
+Future<String?> showUpdatePrompt(BuildContext context, UpdateInfo info) {
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('发现新版本 v${info.versionName}'),
+      content: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('当前 v$kAppVersionName（构建号 $kAppVersionCode）',
+                style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 2),
+            Text(
+                '最新 v${info.versionName}（构建号 ${info.versionCode}）'
+                '${info.sizeText.isEmpty ? '' : '　${info.sizeText}'}'
+                '${info.releaseDate.isEmpty ? '' : '　${info.releaseDate}'}',
+                style: const TextStyle(fontSize: 13)),
+            if (info.forced)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text('此版本要求强制更新',
+                    style: TextStyle(fontSize: 13, color: Colors.red)),
+              ),
+            if (info.changelog.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              const Text('更新内容',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+              const SizedBox(height: 6),
+              ...info.changelog.map((e) => Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Text('· $e', style: const TextStyle(fontSize: 13)),
+                  )),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        if (!info.forced)
+          TextButton(
+            onPressed: () async {
+              await Updater.skipVersion(info.versionCode);
+              if (ctx.mounted) Navigator.pop(ctx, 'skip');
+            },
+            child: const Text('跳过此版本'),
+          ),
+        if (!info.forced)
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'later'),
+              child: const Text('稍后')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, 'update'),
+            child: const Text('立即更新')),
+      ],
+    ),
+  );
+}
+
+/// 下载并唤起系统安装器，结束后用 SnackBar 汇报结果
+Future<void> showUpdateDownload(BuildContext context, UpdateInfo info) async {
+  final msg = await showDialog<String>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => _UpdateDownloadDialog(info: info),
+  );
+  if (msg == null || !context.mounted) return;
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    content: Text(msg),
+    duration: const Duration(seconds: 6),
+    action: SnackBarAction(
+      label: '重试安装',
+      onPressed: () => retryInstallLatest(context),
+    ),
+  ));
+}
+
+/// 重装本地已下载的最新 APK（授权后重试用）
+Future<void> retryInstallLatest(BuildContext context) async {
+  final files = await Updater.downloadedApks();
+  if (!context.mounted) return;
+  if (files.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('没有找到已下载的安装包')));
+    return;
+  }
+  final r = await Updater.install(files.first);
+  if (!context.mounted) return;
+  ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(installResultMessage(r))));
+}
+
+/// 从本地已下载的包中挑一个
+Future<File?> pickLocalApk(BuildContext context, List<File> files) {
+  return showModalBottomSheet<File>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: ListView(
+        shrinkWrap: true,
+        children: [
+          const ListTile(
+            dense: true,
+            title: Text('选择要安装的包',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          ...files.map((f) {
+            final st = f.statSync();
+            return ListTile(
+              leading: const Icon(Icons.android),
+              title: Text(f.path.split('/').last),
+              subtitle:
+                  Text('${formatBytes(st.size)}　${_fmtTime(st.modified)}'),
+              onTap: () => Navigator.pop(ctx, f),
+            );
+          }),
+        ],
+      ),
+    ),
+  );
+}
+
+/// 把 MethodChannel 的返回值转成给用户看的话
+String installResultMessage(String r) {
+  if (r == 'ok') return '已唤起系统安装器，按提示完成安装';
+  if (r == 'need_permission') {
+    return '已打开系统设置：请允许「蜗词」安装应用，再点「重试安装」';
+  }
+  if (r == 'unsupported') return '当前环境不支持应用内安装，请到下载目录手动安装';
+  return '安装失败：${r.replaceFirst('error:', '')}';
+}
+
+String _fmtTime(DateTime t) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
+}
+
+/// 下载进度对话框：负责下载 → 唤起安装 → 把结果文案 pop 回去
+class _UpdateDownloadDialog extends StatefulWidget {
+  final UpdateInfo info;
+  const _UpdateDownloadDialog({required this.info});
+  @override
+  State<_UpdateDownloadDialog> createState() => _UpdateDownloadDialogState();
+}
+
+class _UpdateDownloadDialogState extends State<_UpdateDownloadDialog> {
+  double _p = 0;
+  String _stage = '正在下载…';
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _run();
+  }
+
+  Future<void> _run() async {
+    try {
+      final apk = await Updater.download(widget.info, (p) {
+        if (mounted && p >= 0) setState(() => _p = p);
+      });
+      if (!mounted) return;
+      setState(() => _stage = '正在唤起安装器…');
+      final r = await Updater.install(apk);
+      if (!mounted) return;
+      final msg = r == 'ok'
+          ? '已唤起系统安装器，按提示完成安装'
+          : r == 'need_permission'
+              ? '已打开系统设置：请允许「蜗词」安装应用，再点「重试安装」'
+              : r == 'unsupported'
+                  ? '当前环境不支持应用内安装，包已存到 ${apk.path}'
+                  : '安装失败：${r.replaceFirst('error:', '')}';
+      Navigator.pop(context, msg);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e'
+            .replaceFirst('HttpException: ', '')
+            .replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (_p * 100).clamp(0, 100).toStringAsFixed(0);
+    final sizeText = widget.info.size > 0
+        ? '${formatBytes((widget.info.size * _p).round())} / ${widget.info.sizeText}'
+        : '';
+    return AlertDialog(
+      title: Text('更新到 v${widget.info.versionName}'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_error.isEmpty) ...[
+            LinearProgressIndicator(value: _p <= 0 ? null : _p),
+            const SizedBox(height: 12),
+            Text('$_stage $pct%',
+                style: const TextStyle(fontSize: 13)),
+            if (sizeText.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(sizeText,
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+              ),
+          ] else ...[
+            const Text('下载失败',
+                style: TextStyle(fontSize: 14, color: Colors.red)),
+            const SizedBox(height: 6),
+            Text(_error, style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 6),
+            Text('可检查更新源地址、网络，或换个网络环境后重试。',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, null),
+          child: Text(_error.isEmpty ? '取消' : '关闭'),
+        ),
+      ],
     );
   }
 }

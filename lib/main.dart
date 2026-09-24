@@ -8,6 +8,7 @@ import 'dict.dart';
 import 'llm.dart';
 import 'notify.dart';
 import 'organize.dart';
+import 'update.dart';
 import 'wordlist_page.dart';
 import 'wordbook.dart';
 import 'wordbook_page.dart';
@@ -42,6 +43,7 @@ class _WoCiAppState extends State<WoCiApp> {
       await WordBooks.load();
       await Llm.load();
       await AppPrefs.load();
+      await Updater.load();
       await Notify.init();
       await registerBackgroundTask();
     } catch (e) {
@@ -146,13 +148,30 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _autoOrganize();
+    _silentUpdateCheck();
+  }
+
+  /// 启动后的静默检查更新：最多每 6 小时一次，只有发现新版本才提示，平时不打扰
+  Future<void> _silentUpdateCheck() async {
+    if (!Updater.configured) return;
+    final last = Updater.lastCheck;
+    if (last != null && DateTime.now().difference(last).inHours < 6) return;
+    // 等首页渲染稳定后再查，避免和启动时的字典/整理抢资源
+    await Future<void>.delayed(const Duration(seconds: 3));
+    if (!mounted) return;
+    final r = await Updater.check();
+    if (!mounted || r.status != UpdateStatus.hasUpdate) return;
+    final action = await showUpdatePrompt(context, r.info!);
+    if (!mounted || action != 'update') return;
+    await showUpdateDownload(context, r.info!);
   }
 
   /// 启动即触发当日整理（幂等：当天已整理自动跳过）
+  /// 配了 AI 时也会顺带补齐此前漏掉增强的词
   Future<void> _autoOrganize() async {
     final r = await Organize.run();
     if (!mounted) return;
-    if (r == 'llm') _refreshAll();
+    if (r.usedLlm) _refreshAll();
   }
 
   void _refreshAll() {
@@ -542,7 +561,13 @@ class _QuizSession {
   /// 每题对应单词的序号（用于分组判分）
   final List<int> wordIndexOf = [];
   final List<WordEntry> words;
-  _QuizSession(this.words, List<QuizMode> modes) {
+
+  /// 同话题词池：给「话题联想」抽干扰项。
+  /// 必须在生成题目之前就取到，所以由 build() 传入——
+  /// 早前是在构造完成之后才赋值，导致首次测验时这里恒为空表。
+  final List<WordEntry> topicPool;
+
+  _QuizSession(this.words, List<QuizMode> modes, this.topicPool) {
     for (var wi = 0; wi < words.length; wi++) {
       for (final m in modes) {
         final q = _build(words[wi], m);
@@ -563,8 +588,10 @@ class _QuizSession {
 
   static Future<_QuizSession> build() async {
     final due = await DB.dueWords(limit: 50);
+    // 词池要先于题目生成取好
+    final pool = await DB.allWords();
     final modes = AppPrefs.studyModes.map(_fromKey).toList();
-    return _QuizSession(due, modes);
+    return _QuizSession(due, modes, pool);
   }
 
   _QuizQuestion? _build(WordEntry w, QuizMode mode) {
@@ -584,15 +611,20 @@ class _QuizSession {
     final enToZh = w.id!.isOdd;
     final List<String> options = [];
     if (enToZh) {
-      final correct = w.translation.isEmpty ? w.word : w.translation;
+      // 看词选义：干扰项要用义项不重叠的词。若也走 sameSenseWords，
+      // 选项之间的中文释义高度重叠，会出现两个选项都说得通的歧义题。
+      final correct =
+          w.translation.isEmpty ? w.word : Dict.firstSense(w.translation);
       options.add(correct);
-      for (final d in Dict.distractors(w.word, 3)) {
+      for (final d in Dict.randomDistractors(w.word, 16)) {
         final di = Dict.lookup(d);
-        final trans = di?.translation ?? d;
-        if (trans != correct && !options.contains(trans)) options.add(trans);
+        final trans = di == null ? d : Dict.firstSense(di.translation);
+        if (trans.isEmpty || trans == correct || options.contains(trans)) continue;
+        options.add(trans);
         if (options.length >= 4) break;
       }
     } else {
+      // 看义选词：用同义/近义词做干扰，这才考辨析
       options.add(w.word);
       for (final d in Dict.distractors(w.word, 3)) {
         if (!options.contains(d)) options.add(d);
@@ -600,14 +632,21 @@ class _QuizSession {
       }
     }
     options.shuffle();
-    final correctText = enToZh ? (w.translation.isEmpty ? w.word : w.translation) : w.word;
+    final correctText = enToZh
+        ? (w.translation.isEmpty ? w.word : Dict.firstSense(w.translation))
+        : w.word;
     return _QuizQuestion(
         entry: w, mode: QuizMode.random, enToZh: enToZh,
         options: options, answerIndex: options.indexOf(correctText));
   }
 
   _QuizQuestion? _senseQ(WordEntry w) {
-    final cloze = w.example.isNotEmpty ? Organize.makeCloze(w.example, w.word) : null;
+    // 优先用 LLM 生成并入库的挖空例句，缺失时再本地拼
+    final cloze = w.example.isEmpty
+        ? null
+        : (w.cloze.isNotEmpty
+            ? w.cloze
+            : Organize.makeCloze(w.example, w.word));
     if (cloze != null) {
       final options = <String>[w.word];
       for (final d in Dict.sameSenseWords(w.word, max: 12)) {
@@ -652,13 +691,10 @@ class _QuizSession {
         options: options, answerIndex: options.indexOf(w.word));
   }
 
-  static List<WordEntry>? _topicPool;
-
   List<String> _sameTopicWords(WordEntry w) {
-    _topicPool ??= <WordEntry>[]; // 延后填充（见 build 后 _fillTopicPool）
-    final pool = _topicPool!;
     final rnd = Random(w.id!);
-    final cands = pool.where((e) => e.topic == w.topic && e.word != w.word).toList();
+    final cands =
+        topicPool.where((e) => e.topic == w.topic && e.word != w.word).toList();
     cands.shuffle(rnd);
     return cands.take(3).map((e) => e.word).toList();
   }
@@ -693,8 +729,6 @@ class _QuizPageState extends State<QuizPage> {
 
   Future<void> _build() async {
     final session = await _QuizSession.build();
-    // 同话题词池：给话题联想出干扰项
-    _QuizSession._topicPool = await DB.allWords();
     if (!mounted) return;
     setState(() { _session = session; _loading = false; });
   }
@@ -803,7 +837,7 @@ class _QuizPageState extends State<QuizPage> {
               Center(
                 child: q.enToZh
                     ? Text(w.word, style: const TextStyle(fontSize: 40, fontWeight: FontWeight.bold))
-                    : Text(w.translation.isEmpty ? w.word : w.translation.split('；').first.split(';').first,
+                    : Text(w.translation.isEmpty ? w.word : Dict.firstSense(w.translation),
                         style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
                         textAlign: TextAlign.center),
               ),
@@ -832,7 +866,7 @@ class _QuizPageState extends State<QuizPage> {
               if (w.translation.isNotEmpty)
                 Center(child: Padding(
                   padding: const EdgeInsets.only(top: 4),
-                  child: Text('释义提示：${w.translation.split('；').first.split(';').first}',
+                  child: Text('释义提示：${Dict.firstSense(w.translation)}',
                       style: TextStyle(fontSize: 12, color: Colors.grey[500])),
                 )),
               const SizedBox(height: 24),
@@ -844,7 +878,7 @@ class _QuizPageState extends State<QuizPage> {
               if (w.translation.isNotEmpty)
                 Center(child: Padding(
                   padding: const EdgeInsets.only(top: 4),
-                  child: Text('释义：${w.translation.split('；').first.split(';').first}',
+                  child: Text('释义：${Dict.firstSense(w.translation)}',
                       style: TextStyle(fontSize: 13, color: Colors.grey[600])),
                 )),
               const SizedBox(height: 6),
@@ -857,7 +891,7 @@ class _QuizPageState extends State<QuizPage> {
               Center(child: Text(w.topic.isEmpty ? '生活日常' : w.topic,
                   style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: kGreen))),
               const SizedBox(height: 10),
-              Center(child: Text(w.translation.isEmpty ? '(无释义)' : w.translation.split('；').first.split(';').first,
+              Center(child: Text(w.translation.isEmpty ? '(无释义)' : Dict.firstSense(w.translation),
                   style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
                   textAlign: TextAlign.center)),
               const SizedBox(height: 6),
@@ -999,7 +1033,7 @@ class _QuizPageState extends State<QuizPage> {
         Center(child: Text('正确答案：${w.word}',
             style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))),
         const SizedBox(height: 4),
-        Center(child: Text(w.translation.isEmpty ? '' : w.translation.split('；').first.split(';').first,
+        Center(child: Text(w.translation.isEmpty ? '' : Dict.firstSense(w.translation),
             style: const TextStyle(fontSize: 15, color: kGreen, fontWeight: FontWeight.w600))),
         const SizedBox(height: 16),
         _analysisCard(w),

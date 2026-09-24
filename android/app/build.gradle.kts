@@ -51,4 +51,6 @@ flutter {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // FileProvider（应用内安装 APK 需要）；Flutter embedding 已传递依赖，此处显式声明避免解析差异
+    implementation("androidx.core:core-ktx:1.13.1")
 }

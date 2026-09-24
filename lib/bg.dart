@@ -5,6 +5,7 @@ import 'package:workmanager/workmanager.dart';
 import 'csv_io.dart';
 import 'db.dart';
 import 'dict.dart';
+import 'llm.dart';
 import 'organize.dart';
 
 const kWociDailyTask = 'wociDailyTask';
@@ -15,7 +16,12 @@ void callbackDispatcher() {
     try {
       await DB.instance;
       await Dict.load();
-      // 当天整理（幂等）；后台场景常在跨天后跑，强制对"今天"做一次
+      // 后台跑在独立 isolate，静态变量不共享：不加载配置的话
+      // Llm.configured 恒为 false，AI 增强会被静默跳过。
+      try {
+        await Llm.load();
+      } catch (_) {}
+      // 当天整理 + 补齐漏掉的 AI 增强（幂等）；后台场景常在跨天后跑
       await Organize.run(force: true);
       await CsvIo.autoBackup();
       return true;

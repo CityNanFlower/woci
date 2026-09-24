@@ -13,6 +13,7 @@
 - **CSV 备份**：全量生词（含复习进度）导出分享 / 导入合并去重
 - **后台任务**：每日 22:00 自动整理 + 自动 CSV 本地备份（保留最近 7 份）
 - **统计与打卡**：月历打卡、连续天数、近 7/30 日复习量柱状图、词汇量累计曲线
+- **应用内更新**：启动静默检查 + 设置页手动检查，可自定义更新源，发现新版本后在 App 内下载并唤起系统安装器
 
 ## 数据来源与致谢
 
@@ -60,6 +61,31 @@ PUB_HOSTED_URL=https://pub.flutter-io.cn
    GRADLE_OPTS='-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.workers.max=1' \
      flutter build apk --release
    ```
+
+## 发布新版本 / 应用内更新
+
+App 的「设置 → 软件更新」里填一个 `version.json` 的直链即可（也可只填所在目录，会自动补
+`/version.json`；建议用 https，也兼容 http）。
+
+清单字段：
+
+- `versionCode`（必填，整数）：**只有大于 App 当前构建号**才会提示更新
+- `apkUrl`（必填）：APK 直链
+- `versionName`：展示用版本号，如 `1.2.2`
+- `size`：字节数，用于下载后校验完整性（填 0 则跳过）
+- `sha1`：仅作人工核对，App 不强制校验
+- `minVersionCode`：低于它的旧版本会看到「强制更新」（不显示「稍后 / 跳过此版本」）
+- `changelog`：字符串数组，显示在更新弹窗里
+- `releaseDate`：展示用日期
+
+发布流程：
+
+1. 改 `pubspec.yaml` 的 `version:`（同时把 `lib/update.dart` 里的
+   `kAppVersionName` / `kAppVersionCode` 改成一致 —— 这是 App 侧比较版本的依据）
+2. 构建 APK，把产物放进 `release/apk/`
+3. 上传 APK 到你的分发位置（对象存储 / GitHub Release / 自建服务器均可）
+4. `python release/gen-version-json.py --url <你的APK直链>` 生成 `release/version.json`
+5. 把 `version.json` 上传到与 APK 同目录，把该地址填进 App 的设置页
 
 ## License
 

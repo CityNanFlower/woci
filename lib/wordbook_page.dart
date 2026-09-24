@@ -81,9 +81,9 @@ class _BookshelfPageState extends State<BookshelfPage> {
     final path = picked?.files.single.path;
     if (path == null) return;
     final raw = await File(path).readAsString();
-    if (raw.codeUnitAt(0) == 0xFEFF) raw.substring(0); // noop 防误用
-    var text = raw;
-    if (text.isNotEmpty && text.codeUnitAt(0) == 0xFEFF) text = text.substring(1);
+    // 去掉 UTF-8 BOM
+    final text =
+        raw.isNotEmpty && raw.codeUnitAt(0) == 0xFEFF ? raw.substring(1) : raw;
 
     final words = <String>{};
     try {
@@ -292,7 +292,9 @@ class _BookDetailPageState extends State<BookDetailPage> {
                           final w = _visible[i];
                           final inBook = _inBook.contains(w);
                           final item = Dict.lookup(w);
-                          final trans = item?.translation.split('；').first ?? '';
+                          final trans = item == null
+                              ? ''
+                              : Dict.firstSense(item.translation);
                           return CheckboxListTile(
                             dense: true,
                             value: inBook || _selected.contains(w),

@@ -21,6 +21,7 @@ class WordEntry {
   final String senseGroup; // 词义群（同义词串）
   final String senseNote; // 一句话辨析
   final String example; // 英文例句
+  final String cloze; // 例句挖空版（LLM 生成，缺失时本地拼）
   final String source; // 来源：真题/听力/阅读/写作/翻译，空=未分类
 
   WordEntry({
@@ -38,6 +39,7 @@ class WordEntry {
     this.senseGroup = '',
     this.senseNote = '',
     this.example = '',
+    this.cloze = '',
     this.source = '',
   });
 
@@ -56,6 +58,7 @@ class WordEntry {
         'sense_group': senseGroup,
         'sense_note': senseNote,
         'example': example,
+        'cloze': cloze,
         'source': source,
       };
 
@@ -74,6 +77,7 @@ class WordEntry {
         senseGroup: (m['sense_group'] ?? '') as String,
         senseNote: (m['sense_note'] ?? '') as String,
         example: (m['example'] ?? '') as String,
+        cloze: (m['cloze'] ?? '') as String,
         source: (m['source'] ?? '') as String,
       );
 }
@@ -94,6 +98,9 @@ class DB {
   /// 艾宾浩斯间隔表（天）：当天、1、2、4、7、15、30，之后进长期池每月抽查
   static const schedule = [0, 1, 2, 4, 7, 15, 30];
 
+  /// 当前 schema 版本（v4 新增 words.cloze）
+  static const dbVersion = 4;
+
   static Future<Database> get instance async {
     _db ??= await _open();
     return _db!;
@@ -101,7 +108,7 @@ class DB {
 
   static Future<Database> _open() async {
     final dir = await getDatabasesPath();
-    return openDatabase(p.join(dir, 'woci.db'), version: 3,
+    return openDatabase(p.join(dir, 'woci.db'), version: dbVersion,
         onCreate: (db, v) async {
       await db.execute('''
         CREATE TABLE words(
@@ -119,6 +126,7 @@ class DB {
           sense_group TEXT DEFAULT '',
           sense_note TEXT DEFAULT '',
           example TEXT DEFAULT '',
+          cloze TEXT DEFAULT '',
           source TEXT DEFAULT ''
         )''');
       await db.execute('''
@@ -175,6 +183,9 @@ class DB {
             words_json TEXT NOT NULL,
             created_at TEXT NOT NULL
           )''');
+      }
+      if (oldV < 4) {
+        await db.execute("ALTER TABLE words ADD COLUMN cloze TEXT DEFAULT ''");
       }
     });
   }
@@ -319,17 +330,79 @@ class DB {
     return rows.map(WordEntry.fromMap).toList();
   }
 
+  /// 待 AI 增强的词：缺例句或缺辨析（这两个字段只有 LLM 会填）
+  static Future<List<WordEntry>> wordsPendingEnrich({int limit = 200}) async {
+    final db = await instance;
+    final rows = await db.query('words',
+        where: "example = '' OR sense_note = ''",
+        orderBy: 'id ASC',
+        limit: limit);
+    return rows.map(WordEntry.fromMap).toList();
+  }
+
+  static Future<int> countPendingEnrich() async {
+    final db = await instance;
+    final rows = await db.rawQuery(
+        "SELECT COUNT(*) AS c FROM words WHERE example = '' OR sense_note = ''");
+    return (rows.first['c'] as int?) ?? 0;
+  }
+
   /// 写入聚类与 LLM 增强结果
   static Future<void> enrichWord(int id,
-      {String? topic, String? senseGroup, String? senseNote, String? example}) async {
+      {String? topic,
+      String? senseGroup,
+      String? senseNote,
+      String? example,
+      String? cloze}) async {
     final db = await instance;
     final m = <String, Object?>{};
     if (topic != null) m['topic'] = topic;
     if (senseGroup != null) m['sense_group'] = senseGroup;
     if (senseNote != null) m['sense_note'] = senseNote;
     if (example != null) m['example'] = example;
+    if (cloze != null) m['cloze'] = cloze;
     if (m.isEmpty) return;
     await db.update('words', m, where: 'id = ?', whereArgs: [id]);
+  }
+
+  // ---------------- 复习记录（备份 / 恢复） ----------------
+
+  /// 全量复习记录（带单词，导出备份用）
+  static Future<List<Map<String, Object?>>> allReviews() async {
+    final db = await instance;
+    return db.rawQuery('''
+      SELECT w.word AS word, r.result AS result, r.at AS at
+      FROM reviews r JOIN words w ON w.id = r.word_id
+      ORDER BY r.at ASC
+    ''');
+  }
+
+  /// 已有的 (word_id|at) 集合，导入时去重
+  static Future<Set<String>> reviewKeys() async {
+    final db = await instance;
+    final rows = await db.rawQuery('SELECT word_id, at FROM reviews');
+    return {for (final r in rows) '${r['word_id']}|${r['at']}'};
+  }
+
+  /// 单词 → id 映射（导入复习记录时按单词回填）
+  static Future<Map<String, int>> wordIdMap() async {
+    final db = await instance;
+    final rows = await db.query('words', columns: ['id', 'word']);
+    return {
+      for (final r in rows)
+        (r['word'] as String).toLowerCase(): r['id'] as int,
+    };
+  }
+
+  /// 按 (word_id, at) 去重写入复习记录；已存在返回 false
+  static Future<bool> addReviewIfAbsent(
+      int wordId, int result, String at, Set<String> seen) async {
+    final key = '$wordId|$at';
+    if (seen.contains(key)) return false;
+    seen.add(key);
+    final db = await instance;
+    await db.insert('reviews', {'word_id': wordId, 'result': result, 'at': at});
+    return true;
   }
 
   // ---------------- 统计 ----------------
@@ -341,7 +414,7 @@ class DB {
     final rows = await db.rawQuery('''
       SELECT substr(at, 1, 10) AS d, COUNT(*) AS c
       FROM reviews WHERE at >= ? GROUP BY substr(at, 1, 10)
-    ''', ['$from T00:00'.replaceAll(' ', '')]);
+    ''', ['${from}T00:00']);
     return {for (final r in rows) r['d'] as String: (r['c'] as int?) ?? 0};
   }
 
