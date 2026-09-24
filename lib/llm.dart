@@ -73,6 +73,9 @@ class LlmSettings {
 class Llm {
   static LlmSettings _s = LlmSettings();
 
+  /// 最近一次 chat 失败的原因（成功时清空），供测试连接等场景展示
+  static String? lastError;
+
   static LlmSettings get settings => _s;
   static bool get configured => _s.key.isNotEmpty && _s.baseUrl.isNotEmpty;
 
@@ -116,21 +119,38 @@ class Llm {
                 'max_tokens': maxTokens,
               }))
           .timeout(timeout);
-      if (resp.statusCode != 200) return null;
+      if (resp.statusCode != 200) {
+        final body = utf8.decode(resp.bodyBytes, allowMalformed: true);
+        lastError = 'HTTP ${resp.statusCode}'
+            '${body.isEmpty ? '' : '：${_snippet(body)}'}';
+        return null;
+      }
       final data = json.decode(utf8.decode(resp.bodyBytes));
       final content = data['choices']?[0]?['message']?['content'];
-      return content is String && content.isNotEmpty ? content : null;
-    } catch (_) {
+      if (content is String && content.isNotEmpty) {
+        lastError = null;
+        return content;
+      }
+      lastError = '响应里没有内容（模型可能返回了思考/空回复）';
+      return null;
+    } catch (e) {
+      lastError = e.toString().replaceFirst('Exception: ', '');
       return null;
     }
   }
 
-  /// 测试连接：返回 null=成功，否则错误信息
+  /// 错误正文截短，避免弹窗塞满
+  static String _snippet(String body) {
+    final one = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return one.length > 120 ? '${one.substring(0, 120)}…' : one;
+  }
+
+  /// 测试连接：返回 null=成功，否则错误信息（带具体原因）
   static Future<String?> testConnection() async {
     if (_s.key.isEmpty) return '请先填写 API Key';
     if (_s.baseUrl.isEmpty || _s.model.isEmpty) return '请填写接口地址与模型名';
     final r = await chat('You are a ping helper.', '回复"OK"两个字母即可',
         maxTokens: 8, timeout: const Duration(seconds: 15));
-    return r == null ? '连接失败：检查 Key / 地址 / 模型名 / 网络' : null;
+    return r == null ? '连接失败：${lastError ?? "未知错误"}' : null;
   }
 }

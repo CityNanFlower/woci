@@ -1,7 +1,7 @@
 name: wo_ci
 description: "蜗词 - 六级冲刺生词本（开源版）"
 publish_to: 'none'
-version: 1.2.2+6
+version: 1.2.3+7
 
 environment:
   sdk: ^3.13.4

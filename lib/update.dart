@@ -1,8 +1,9 @@
 /// 应用内更新：检查新版本 → 下载 APK → 唤起系统安装器
 ///
-/// 更新源地址由用户在「设置 → 软件更新」里填写，可以是：
-///   · version.json 的直链，如 https://example.com/woci/version.json
-///   · 或只填所在目录，如 https://example.com/woci/ （自动补 /version.json）
+/// 内置官方更新源（GitHub Release 的 version.json），无需用户手填；
+/// 用户仍可在「设置 → 软件更新」改成自己的地址。
+/// GitHub 直连在国内不稳，清单与 APK 下载失败时会自动依次尝试
+/// 内置的加速镜像（gh-proxy 风格：镜像前缀 + 完整原始 URL），并记住本次成功的镜像。
 ///
 /// 全程零新增第三方依赖：http（请求/下载）+ path_provider（落盘）+ shared_preferences（配置）
 /// + 自建 MethodChannel（安装）。
@@ -18,8 +19,46 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 当前版本 —— ⚠ 发版时必须与 pubspec.yaml 的 `version:` 同步（格式 主.次.修订+构建号）
-const String kAppVersionName = '1.2.2';
-const int kAppVersionCode = 6;
+const String kAppVersionName = '1.2.3';
+const int kAppVersionCode = 7;
+
+/// 内置官方更新源（本仓库 Release 的最新清单），应用首次启动即生效
+const String kDefaultUpdateSource =
+    'https://github.com/CityNanFlower/woci/releases/latest/download/version.json';
+
+/// GitHub 加速镜像（gh-proxy 风格：前缀 + 完整原始 URL）。
+/// 直连失败时按顺序尝试；均为公共服务，失效会自动跳过换下一个。
+const List<String> kGithubMirrors = [
+  'https://gh-proxy.com/',
+  'https://ghfast.top/',
+  'https://gh.ddlc.top/',
+  'https://ghproxy.net/',
+];
+
+/// 判断是否 GitHub 系直链（只有这类地址才需要镜像加速）
+bool isGithubUrl(String url) {
+  final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+  return host == 'github.com' ||
+      host.endsWith('.github.com') ||
+      host.endsWith('.githubusercontent.com');
+}
+
+/// 生成一条 URL 的候选列表：原地址在前（尊重自建源），GitHub 直链后面跟各镜像
+List<String> candidatesFor(String url, {String? preferredMirror}) {
+  final list = <String>[url];
+  if (isGithubUrl(url)) {
+    final mirrors = [...kGithubMirrors];
+    if (preferredMirror != null && mirrors.contains(preferredMirror)) {
+      mirrors
+        ..remove(preferredMirror)
+        ..insert(0, preferredMirror);
+    }
+    for (final m in mirrors) {
+      list.add('$m$url');
+    }
+  }
+  return list;
+}
 
 /// 与 Android 端 MainActivity 约定的通道名
 const MethodChannel kUpdateChannel = MethodChannel('com.shanqiu.wo_ci/update');
@@ -124,7 +163,7 @@ class Updater {
   static const _kSkip = 'update_skipped_code';
   static const _kLastCheck = 'update_last_check_ms';
 
-  /// 更新源（用户配置）
+  /// 更新源（用户配置；为空时自动用内置官方源）
   static String sourceUrl = '';
 
   /// 用户主动「跳过此版本」的 versionCode
@@ -133,11 +172,16 @@ class Updater {
   /// 上次检查时间
   static DateTime? lastCheck;
 
+  /// 本次会话里最近一次成功的镜像前缀（加速清单成功后，下载 APK 优先复用）
+  static String? lastGoodMirror;
+
   static bool get configured => sourceUrl.trim().isNotEmpty;
 
   static Future<void> load() async {
     final sp = await SharedPreferences.getInstance();
     sourceUrl = sp.getString(_kUrl) ?? '';
+    // 没配置过 ⇒ 直接用内置官方源，开箱即用
+    if (sourceUrl.trim().isEmpty) sourceUrl = kDefaultUpdateSource;
     skippedCode = sp.getInt(_kSkip) ?? 0;
     final ms = sp.getInt(_kLastCheck);
     lastCheck = ms == null ? null : DateTime.fromMillisecondsSinceEpoch(ms);
@@ -172,7 +216,7 @@ class Updater {
     return u;
   }
 
-  /// 检查更新。
+  /// 检查更新：直连优先，失败自动切镜像。
   /// [manual] = 用户手动点击（此时忽略「跳过此版本」）
   static Future<UpdateCheckResult> check({bool manual = false}) async {
     if (!configured) {
@@ -180,41 +224,58 @@ class Updater {
           message: '还没有配置更新源地址');
     }
     final manifest = resolveManifestUrl(sourceUrl);
-    try {
-      final resp = await http
-          .get(Uri.parse(manifest))
-          .timeout(const Duration(seconds: 15));
-      if (resp.statusCode != 200) {
-        return UpdateCheckResult(UpdateStatus.error,
-            message: '服务器返回 HTTP ${resp.statusCode}');
-      }
-      final decoded = json.decode(utf8.decode(resp.bodyBytes));
-      if (decoded is! Map<String, dynamic>) {
-        return const UpdateCheckResult(UpdateStatus.error,
-            message: '清单格式不对：需要一个 JSON 对象');
-      }
-      final info = UpdateInfo.tryParse(decoded);
-      if (info == null) {
-        return const UpdateCheckResult(UpdateStatus.error,
-            message: '清单缺少 versionCode 或 apkUrl 字段');
-      }
+    final candidates = candidatesFor(manifest, preferredMirror: lastGoodMirror);
+    Object? lastErr;
+    for (final url in candidates) {
+      try {
+        final resp = await http
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 12));
+        if (resp.statusCode != 200) {
+          lastErr = '服务器返回 HTTP ${resp.statusCode}';
+          continue;
+        }
+        final decoded = json.decode(utf8.decode(resp.bodyBytes));
+        if (decoded is! Map<String, dynamic>) {
+          return const UpdateCheckResult(UpdateStatus.error,
+              message: '清单格式不对：需要一个 JSON 对象');
+        }
+        final info = UpdateInfo.tryParse(decoded);
+        if (info == null) {
+          return const UpdateCheckResult(UpdateStatus.error,
+              message: '清单缺少 versionCode 或 apkUrl 字段');
+        }
+        // 记住这次走通的镜像（原地址直连成功时清掉）
+        lastGoodMirror = url == manifest ? null : _mirrorPrefixOf(url, manifest);
 
-      await _touchLastCheck();
+        await _touchLastCheck();
 
-      if (info.versionCode <= kAppVersionCode) {
-        return UpdateCheckResult(UpdateStatus.upToDate, info: info);
+        if (info.versionCode <= kAppVersionCode) {
+          return UpdateCheckResult(UpdateStatus.upToDate, info: info);
+        }
+        if (!manual && !info.forced && info.versionCode == skippedCode) {
+          return UpdateCheckResult(UpdateStatus.upToDate, info: info);
+        }
+        return UpdateCheckResult(UpdateStatus.hasUpdate, info: info);
+      } on TimeoutException {
+        lastErr = '请求超时';
+      } on FormatException {
+        return const UpdateCheckResult(UpdateStatus.error,
+            message: '清单不是合法 JSON');
+      } catch (e) {
+        lastErr = e;
       }
-      if (!manual && !info.forced && info.versionCode == skippedCode) {
-        return UpdateCheckResult(UpdateStatus.upToDate, info: info);
-      }
-      return UpdateCheckResult(UpdateStatus.hasUpdate, info: info);
-    } on TimeoutException {
-      return const UpdateCheckResult(UpdateStatus.error, message: '请求超时，检查网络或地址');
-    } on FormatException {
-      return const UpdateCheckResult(UpdateStatus.error, message: '清单不是合法 JSON');
-    } catch (e) {
-      return UpdateCheckResult(UpdateStatus.error, message: '检查失败：$e');
     }
+    final where = isGithubUrl(manifest) ? '（GitHub 直连与镜像都失败了）' : '';
+    return UpdateCheckResult(UpdateStatus.error,
+        message: '检查失败：$lastErr$where');
+  }
+
+  /// 从镜像候选 URL 反推它用的前缀（原 URL 之前的部分）
+  static String? _mirrorPrefixOf(String candidate, String origin) {
+    if (candidate.length <= origin.length) return null;
+    if (!candidate.endsWith(origin)) return null;
+    return candidate.substring(0, candidate.length - origin.length);
   }
 
   static Future<void> _touchLastCheck() async {
@@ -237,8 +298,41 @@ class Updater {
     return d;
   }
 
-  /// 下载 APK，[onProgress] 回调 0~1（总长未知时为 null 参数则传 -1）
+  /// 下载 APK，[onProgress] 回调 0~1（总长未知时为 null 参数则传 -1）。
+  /// 直连失败（超时 / 非 200 / 断流 / 校验不过）自动切换到下一个镜像重试。
   static Future<File> download(
+    UpdateInfo info,
+    void Function(double progress) onProgress, {
+    bool Function()? isCancelled,
+  }) async {
+    final candidates =
+        candidatesFor(info.apkUrl, preferredMirror: lastGoodMirror);
+    Object? lastErr;
+    for (final url in candidates) {
+      try {
+        final f = await _downloadOne(
+          url,
+          info,
+          onProgress,
+          isCancelled: isCancelled,
+        );
+        lastGoodMirror = url == info.apkUrl
+            ? null
+            : _mirrorPrefixOf(url, info.apkUrl);
+        return f;
+      } catch (e) {
+        if (isCancelled != null && isCancelled()) rethrow;
+        lastErr = e;
+      }
+    }
+    final where =
+        isGithubUrl(info.apkUrl) ? '（直连与全部镜像均失败）' : '';
+    throw HttpException('下载失败：$lastErr$where', uri: Uri.parse(info.apkUrl));
+  }
+
+  /// 按单一 URL 完成一次完整下载（含大小与 ZIP 头校验）
+  static Future<File> _downloadOne(
+    String url,
     UpdateInfo info,
     void Function(double progress) onProgress, {
     bool Function()? isCancelled,
@@ -247,11 +341,10 @@ class Updater {
     File? failedTarget;
     IOSink? sink;
     try {
-      final req = http.Request('GET', Uri.parse(info.apkUrl));
+      final req = http.Request('GET', Uri.parse(url));
       final resp = await client.send(req).timeout(const Duration(seconds: 30));
       if (resp.statusCode != 200) {
-        throw HttpException('下载失败：HTTP ${resp.statusCode}',
-            uri: resp.request?.url);
+        throw HttpException('HTTP ${resp.statusCode}', uri: resp.request?.url);
       }
 
       final dir = await updateDir();

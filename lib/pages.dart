@@ -154,17 +154,14 @@ class _SettingsPageState extends State<SettingsPage> {
       _updateOk = true;
       _updateMsg = Updater.configured
           ? '已保存：${Updater.resolveManifestUrl(Updater.sourceUrl)}'
-          : '更新源已清空';
+          : '更新源已清空（下次启动将回落到内置官方源）';
     });
   }
 
   Future<void> _checkUpdate() async {
-    if (!Updater.configured && _updateCtrl.text.trim().isEmpty) {
-      setState(() {
-        _updateMsg = '请先填写更新源地址并保存';
-        _updateOk = false;
-      });
-      return;
+    // 输入框留空 ⇒ 回落到内置官方源
+    if (_updateCtrl.text.trim().isEmpty) {
+      _updateCtrl.text = kDefaultUpdateSource;
     }
     await Updater.saveSourceUrl(_updateCtrl.text);
     setState(() {
@@ -466,19 +463,26 @@ class _SettingsPageState extends State<SettingsPage> {
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(height: 4),
           Text(
-              '下载新版本并在应用内安装。更新源填 version.json 的直链，'
-              '或只填它所在的目录（会自动补 /version.json）；建议用 https。',
+              '已内置官方更新源（GitHub Release），开箱即用：检查和下载走 GitHub 直连，'
+              '连不上时自动切换国内加速镜像，无需手动配置。'
+              '也可改成自己的 version.json 直链或所在目录（自动补 /version.json）。',
               style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           const SizedBox(height: 12),
           Row(children: [
             Expanded(
               child: TextField(
                 controller: _updateCtrl,
-                decoration: const InputDecoration(
-                  labelText: '更新源地址',
-                  hintText: 'https://…/version.json',
+                decoration: InputDecoration(
+                  labelText: '更新源地址（内置官方源）',
+                  hintText: kDefaultUpdateSource,
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    tooltip: '恢复默认源',
+                    icon: const Icon(Icons.restart_alt, size: 20),
+                    onPressed: () =>
+                        setState(() => _updateCtrl.text = kDefaultUpdateSource),
+                  ),
                 ),
               ),
             ),
@@ -745,7 +749,7 @@ class _UpdateDownloadDialogState extends State<_UpdateDownloadDialog> {
             const SizedBox(height: 6),
             Text(_error, style: const TextStyle(fontSize: 13)),
             const SizedBox(height: 6),
-            Text('可检查更新源地址、网络，或换个网络环境后重试。',
+            Text('已自动尝试直连与全部加速镜像，可稍后重试或换个网络环境。',
                 style: TextStyle(fontSize: 12, color: Colors.grey[600])),
           ],
         ],
